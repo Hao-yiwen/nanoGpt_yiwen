@@ -12,7 +12,7 @@
 | `v0_char_chinese.py` | 字符级 | 中文歌词版 |
 | `v0_char_rope.py` | 字符级 + RoPE | 中文歌词 + 旋转位置编码 |
 
-### v1-v5 系列 - BPE 分词（推荐）
+### v1-v6 系列 - BPE 分词（推荐）
 
 | 文件 | 特性 | 模型规格 | 说明 |
 |------|------|----------|------|
@@ -21,6 +21,7 @@
 | `v3_gpt2_amp.py` | + AMP + Compile | 768d, 12L, 12H | GPT-2 Small 架构，混合精度训练 |
 | `v4_flash_optim.py` | + Flash Attention | 768d, 12L, 12H | 多项优化：Flash Attention, Weight Decay 等 |
 | `v5_checkpoint.py` | + Checkpoint | 768d, 12L, 12H | 新增：模型保存与恢复，定期预测 |
+| `v6_wandb.py` | + Wandb | 768d, 12L, 12H | 新增：实时 loss 曲线，训练可视化 |
 
 ## 各版本详细特性
 
@@ -53,15 +54,26 @@
 - **DataLoader 多进程**：4 workers + pin_memory + prefetch
 - **GPT-2 权重初始化**：正态分布 N(0, 0.02)，残差层缩放
 
-### v5_checkpoint.py - 完整版（推荐）
+### v5_checkpoint.py - 完整版
 - 包含 v4 所有优化
 - **Checkpoint 保存**：定期保存、最佳模型、断点恢复
 - **训练预测**：每 1000 步生成一次文本预览
 
+### v6_wandb.py - Wandb 可视化（推荐）
+- 包含 v5 所有功能
+- **Wandb 集成**：实时训练监控
+- **Loss 曲线**：train/test loss 实时可视化
+- **学习率曲线**：跟踪 LR 变化
+- **超参数记录**：自动记录所有配置
+- **生成样本**：每 1000 步记录生成的文本样本
+
 ## 快速开始
 
 ```bash
-# 推荐使用最新版本
+# 推荐使用最新版本（带 wandb 可视化）
+python v6_wandb.py
+
+# 或不使用 wandb
 python v5_checkpoint.py
 ```
 
@@ -139,7 +151,7 @@ N_LAYERS = 12
 ## 依赖
 
 ```bash
-pip install torch sentencepiece
+pip install torch sentencepiece wandb
 ```
 
 ## 硬件要求
@@ -147,7 +159,7 @@ pip install torch sentencepiece
 | 版本 | 显存需求 |
 |------|----------|
 | v1/v2 | 8GB+ |
-| v3/v4/v5 | 24GB+（可调整 BATCH_SIZE） |
+| v3/v4/v5/v6 | 24GB+（可调整 BATCH_SIZE） |
 
 ## 参考资料
 
@@ -155,3 +167,4 @@ pip install torch sentencepiece
 - [nanoGPT by Karpathy](https://github.com/karpathy/nanoGPT) - 本项目参考
 - [RoFormer](https://arxiv.org/abs/2104.09864) - RoPE 旋转位置编码
 - [FlashAttention](https://arxiv.org/abs/2205.14135) - Flash Attention 论文
+- [Weights & Biases](https://wandb.ai/) - 实验跟踪平台
