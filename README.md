@@ -1,13 +1,103 @@
-# NanoGPT - 字符级语言模型
+# NanoGPT 中文歌词版
 
-一个简单的 GPT 风格语言模型实现，用于学习 Transformer 架构和自回归语言模型的训练原理。
+基于 Andrej Karpathy 的 NanoGPT，针对中文歌词生成进行优化的系列版本。
+
+## 版本说明
+
+### v0 系列 - 字符级（早期版本）
+
+| 文件 | 特性 | 说明 |
+|------|------|------|
+| `v0_char_english.py` | 字符级 | 英文版，使用 input.txt |
+| `v0_char_chinese.py` | 字符级 | 中文歌词版 |
+| `v0_char_rope.py` | 字符级 + RoPE | 中文歌词 + 旋转位置编码 |
+
+### v1-v5 系列 - BPE 分词（推荐）
+
+| 文件 | 特性 | 模型规格 | 说明 |
+|------|------|----------|------|
+| `v1_bpe_rope.py` | BPE + RoPE | 384d, 6L, 6H | BPE 分词 + 旋转位置编码 |
+| `v2_cosine_lr.py` | + Cosine LR | 512d, 6L, 8H | 新增：余弦退火学习率调度 |
+| `v3_gpt2_amp.py` | + AMP + Compile | 768d, 12L, 12H | GPT-2 Small 架构，混合精度训练 |
+| `v4_flash_optim.py` | + Flash Attention | 768d, 12L, 12H | 多项优化：Flash Attention, Weight Decay 等 |
+| `v5_checkpoint.py` | + Checkpoint | 768d, 12L, 12H | 新增：模型保存与恢复，定期预测 |
+
+## 各版本详细特性
+
+### v0 系列 - 字符级（早期实验）
+- **v0_char_english.py**: 英文字符级，基础 Transformer
+- **v0_char_chinese.py**: 中文歌词字符级
+- **v0_char_rope.py**: 中文歌词 + RoPE 位置编码
+
+> 字符级词汇表小（~5000字符），但序列更长。BPE 版本效率更高。
+
+### v1_bpe_rope.py - 基础版本
+- SentencePiece BPE 分词（vocab_size=8000）
+- RoPE 旋转位置编码
+- 基础 Transformer 架构
+
+### v2_cosine_lr.py - 学习率优化
+- 新增：余弦退火学习率调度（带 warmup）
+- 模型规格提升：512 dim, 8 heads
+
+### v3_gpt2_amp.py - GPT-2 Small
+- GPT-2 Small 架构：768 dim, 12 layers, 12 heads
+- 混合精度训练（AMP）
+- torch.compile 加速
+
+### v4_flash_optim.py - 多项优化
+- **批量化多头注意力**：合并 Q/K/V 投影，减少循环开销
+- **Flash Attention**：`F.scaled_dot_product_attention`，2-4x 加速
+- **Weight Decay**：参数分组，embedding/bias 不衰减
+- **Gradient Clipping**：梯度裁剪，训练更稳定
+- **DataLoader 多进程**：4 workers + pin_memory + prefetch
+- **GPT-2 权重初始化**：正态分布 N(0, 0.02)，残差层缩放
+
+### v5_checkpoint.py - 完整版（推荐）
+- 包含 v4 所有优化
+- **Checkpoint 保存**：定期保存、最佳模型、断点恢复
+- **训练预测**：每 1000 步生成一次文本预览
+
+## 快速开始
+
+```bash
+# 推荐使用最新版本
+python v5_checkpoint.py
+```
+
+训练输出保存在 `checkpoints/` 目录：
+- `best.pt` - 最佳模型（最低 test loss）
+- `latest.pt` - 最新模型（用于恢复训练）
+- `ckpt_1000.pt` 等 - 定期保存点
+
+## 配置参数
+
+编辑文件顶部的超参数：
+
+```python
+# 训练相关
+BATCH_SIZE = 64          # 根据显存调整
+BLOCK_SIZE = 1024        # 上下文长度
+TRAIN_ITERS = 5000       # 训练步数
+
+# 模型架构 (GPT-2 Small)
+N_EMBED = 768
+N_HEADS = 12
+N_LAYERS = 12
+```
+
+## 数据
+
+使用 `ChineseLyrics/` 目录下的中文歌词数据集（约 10 万首歌曲，20M tokens）。
+
+---
 
 ## 模型架构
 
 这是一个 **Decoder-only Transformer**，与 GPT-2 架构类似：
 
 ```
-输入序列 → Token Embedding + Position Embedding
+输入序列 → Token Embedding (RoPE 在 Attention 内部应用)
                         ↓
               ┌─────────────────┐
               │   Transformer   │ × N_LAYERS
@@ -37,103 +127,31 @@
 
 模型的核心任务是：**给定前面的 token，预测下一个 token**。
 
-```
-输入:    [h,   e,   l,   l,   o]
-          ↓    ↓    ↓    ↓    ↓
-目标:    [e,   l,   l,   o,   _]
-```
-
 ### 并行训练机制
 
-这是理解 Transformer 训练的关键点！
-
-**不是**用完整序列预测一个字符，而是**并行地**对每个位置预测下一个字符：
-
-| 位置 | 可见上下文 | 预测目标 |
-|------|-----------|----------|
-| 0 | h | e |
-| 1 | h, e | l |
-| 2 | h, e, l | l |
-| 3 | h, e, l, l | o |
-| 4 | h, e, l, l, o | (下一个) |
+**一次前向传播** = 同时计算 `batch_size × sequence_length` 个预测任务
+- 例如：`batch_size=64, block_size=1024` → 一次计算 **65,536** 个预测
 
 ### Causal Mask（因果掩码）
 
-通过下三角掩码矩阵，确保每个位置只能 attend 到它之前的位置：
+通过 `is_causal=True` 参数（Flash Attention）或下三角掩码矩阵，确保每个位置只能 attend 到它之前的位置。
 
-```
-        h    e    l    l    o
-    ┌─────────────────────────┐
- h  │  ✓    ✗    ✗    ✗    ✗  │  位置0只能看位置0
- e  │  ✓    ✓    ✗    ✗    ✗  │  位置1能看0,1
- l  │  ✓    ✓    ✓    ✗    ✗  │  位置2能看0,1,2
- l  │  ✓    ✓    ✓    ✓    ✗  │  位置3能看0,1,2,3
- o  │  ✓    ✓    ✓    ✓    ✓  │  位置4能看所有
-    └─────────────────────────┘
-```
-
-代码实现：
-```python
-self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-```
-
-### 为什么这样高效？
-
-- **一次前向传播** = 同时计算 `batch_size × sequence_length` 个预测任务
-- 例如：`batch_size=64, block_size=256` → 一次计算 **16,384** 个预测
-- 相比 RNN 逐步计算，Transformer 可以完全并行化
-
-## 字符级 vs 子词级
-
-| 模型 | 分词方式 | 词汇表大小 | 示例 |
-|------|----------|------------|------|
-| 本项目 | 字符级 | ~65 | `h` `e` `l` `l` `o` |
-| GPT-2 | BPE 子词 | 50,257 | `hello` 或 `hel` `lo` |
-
-字符级模型更简单，但需要更长的序列来表达相同的文本。
-
-## 参数配置
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `N_EMBED` | 384 | 嵌入维度 |
-| `N_LAYERS` | 6 | Transformer Block 层数 |
-| `N_HEADS` | 6 | 注意力头数 |
-| `BLOCK_SIZE` | 256 | 最大上下文长度 |
-| `BATCH_SIZE` | 64 | 批次大小 |
-| `LEARNING_RATE` | 3e-4 | 学习率 |
-| `DROP_OUT` | 0.2 | Dropout 比率 |
-
-## 使用方法
-
-### 1. 准备数据
-
-将训练文本放在 `input.txt` 文件中。
-
-### 2. 运行训练
+## 依赖
 
 ```bash
-python v2.py
+pip install torch sentencepiece
 ```
 
-### 3. 输出示例
+## 硬件要求
 
-训练过程会输出：
-- 每 200 步的训练/测试 loss
-- 训练前后的文本生成对比
-
-## 文件结构
-
-```
-.
-├── README.md       # 本文档
-├── v2.py           # 主训练脚本
-└── input.txt       # 训练数据
-```
+| 版本 | 显存需求 |
+|------|----------|
+| v1/v2 | 8GB+ |
+| v3/v4/v5 | 24GB+（可调整 BATCH_SIZE） |
 
 ## 参考资料
 
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - Transformer 原论文
 - [nanoGPT by Karpathy](https://github.com/karpathy/nanoGPT) - 本项目参考
-- [GPT-2 Paper](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
+- [RoFormer](https://arxiv.org/abs/2104.09864) - RoPE 旋转位置编码
+- [FlashAttention](https://arxiv.org/abs/2205.14135) - Flash Attention 论文
