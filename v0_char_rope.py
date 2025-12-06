@@ -156,14 +156,16 @@ class RotaryPositionalEmbedding(nn.Module):
     """RoPE 旋转位置编码"""
     def __init__(self, dim, max_seq_len=BLOCK_SIZE, base=10000):
         super().__init__()
-        # 计算频率 θ_i = base^(-2i/d)
+        # dim是head_size
+        # 计算频率 θ_i = 1 / base^(2i/d) i是0,1,2,...,head_size/2-1
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer('inv_freq', inv_freq) # (dim是head_size//2,)
+        # 计算频率 从1到小 1/1 1/1000^(2/dim是head_size) 1/1000^(4/dim) ... 1/1000^(1)
         
         # 预计算 cos 和 sin（加速）
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.einsum('i,j->ij', t, inv_freq)  # [seq_len, dim//2]
-        emb = torch.cat([freqs, freqs], dim=-1)        # [seq_len, dim]
+        t = torch.arange(max_seq_len).float() # (seq_len,)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)  # [seq_len, dim是head_size//2]
+        emb = torch.cat([freqs, freqs], dim=-1)        # [seq_len, dim是head_size]
         self.register_buffer('cos_cached', emb.cos())
         self.register_buffer('sin_cached', emb.sin())
     
@@ -174,11 +176,16 @@ class RotaryPositionalEmbedding(nn.Module):
 def apply_rotary_pos_emb(q, k, cos, sin):
     """对 Q 和 K 应用旋转"""
     def rotate_half(x):
+        # x1是前一半，x2是后一半
         x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        # 将x2和x1拼接起来，-x2是因为x2是负数，所以需要取反
         return torch.cat([-x2, x1], dim=-1)
     
     # q, k: [B, T, head_dim]
     # cos, sin: [T, head_dim]
+    # 其中rotate_half自带取反操作
+    # 公式 q_embed = q * cos + rotate_half(q) * sin
+    # 公式 k_embed = k * cos + rotate_half(k) * sin
     q_embed = q * cos + rotate_half(q) * sin
     k_embed = k * cos + rotate_half(k) * sin
     return q_embed, k_embed
@@ -200,14 +207,16 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
         self.dropout = nn.Dropout(DROP_OUT)
         
+        # head_size是embed_size/head_num
         self.rope = RotaryPositionalEmbedding(head_size)
 
     def forward(self, x):
+        # x (B, T, N_EMBED)
         B, T, C = x.shape
-        k = self.key(x)    # (B, T, head_size)
+        k = self.key(x)   # (B, T, head_size)
         q = self.query(x)  # (B, T, head_size)
-        cos, sin = self.rope(T)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        cos, sin = self.rope(T) # (T, head_size)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin) # (B, T, head_size)
         
         # 计算注意力分数，并缩放
         wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
@@ -234,6 +243,7 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         # 并行计算所有头，然后在最后一维拼接
+        # x (B, T, N_EMBED)
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.proj(out)
         out = self.dropout(out)
@@ -320,7 +330,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B, T, N_EMBED)
         # pos_emb = self.position_embedding_table(torch.arange(T, device=DEVICE))  # (T, N_EMBED)
         # x = tok_emb + pos_emb  # (B, T, N_EMBED) - 广播相加
-        x = tok_emb
+        x = tok_emb # (B, T, N_EMBED)
 
         # Transformer 处理
         x = self.blocks(x)
