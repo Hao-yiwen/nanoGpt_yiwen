@@ -30,9 +30,24 @@ swanlab login
 
 ### 3. 训练
 
+使用 tmux 在后台运行（推荐）：
+
 ```bash
+# 创建新的 tmux 会话
+tmux new -s train
+
+# 进入目录并开始训练
 cd final_train
 python train.py
+
+# 按 Ctrl+B 然后按 D 分离会话（训练继续在后台运行）
+```
+
+tmux 常用命令：
+```bash
+tmux ls              # 查看所有会话
+tmux attach -t train # 重新连接会话
+tmux kill-session -t train  # 终止会话
 ```
 
 训练输出：
