@@ -86,6 +86,14 @@ python v5_checkpoint.py
 - `latest.pt` - 最新模型（用于恢复训练）
 - `ckpt_1000.pt` 等 - 定期保存点
 
+## 推理（inference）示例
+
+### 命令行快速生成
+
+```bash
+python inference.py --prompt "今夜我" --max_tokens 100
+```
+
 ## 配置参数
 
 编辑文件顶部的超参数：
