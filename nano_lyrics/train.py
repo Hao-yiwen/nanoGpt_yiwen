@@ -17,7 +17,7 @@ from config import (
     BATCH_SIZE, BLOCK_SIZE, LEARNING_RATE, MIN_LR, WARMUP_ITERS, TRAIN_ITERS,
     EVAL_ITERS, EVAL_INTERVAL, WEIGHT_DECAY, GRAD_CLIP,
     NUM_WORKERS, PIN_MEMORY, PREFETCH_FACTOR,
-    USE_AMP, USE_COMPILE,
+    USE_COMPILE,
     CHECKPOINT_DIR, SAVE_INTERVAL, SAVE_BEST, RESUME,
     SWANLAB_PROJECT, SWANLAB_RUN_NAME, USE_SWANLAB,
     INITIAL_GENERATE_TOKENS, FINAL_GENERATE_TOKENS, GENERATE_PROMPT,
@@ -102,7 +102,7 @@ class LyricsDataset(Dataset):
 # Checkpoint 保存与恢复
 # ============================================================================
 
-def save_checkpoint(model, optimizer, scaler, iter_num, best_val_loss, vocab_size, path):
+def save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size, path):
     """保存训练检查点"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     model_state = model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
@@ -110,7 +110,6 @@ def save_checkpoint(model, optimizer, scaler, iter_num, best_val_loss, vocab_siz
     checkpoint = {
         'model': model_state,
         'optimizer': optimizer.state_dict(),
-        'scaler': scaler.state_dict(),
         'iter_num': iter_num,
         'best_val_loss': best_val_loss,
         'config': {
@@ -126,7 +125,7 @@ def save_checkpoint(model, optimizer, scaler, iter_num, best_val_loss, vocab_siz
     print(f"  -> Checkpoint 已保存: {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, scaler=None):
+def load_checkpoint(path, model, optimizer=None):
     """加载训练检查点"""
     print(f"加载 Checkpoint: {path}")
     checkpoint = torch.load(path, map_location=DEVICE)
@@ -138,9 +137,6 @@ def load_checkpoint(path, model, optimizer=None, scaler=None):
 
     if optimizer is not None and 'optimizer' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer'])
-
-    if scaler is not None and 'scaler' in checkpoint:
-        scaler.load_state_dict(checkpoint['scaler'])
 
     iter_num = checkpoint.get('iter_num', 0)
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
@@ -268,7 +264,8 @@ def main():
         print(f"Swanlab 初始化完成: {run_name}")
 
     # ========== 创建模型 ==========
-    model = GPTLanguageModel(vocab_size).to(DEVICE)
+    model = GPTLanguageModel(vocab_size).to(DEVICE).to(torch.bfloat16)
+    print("训练精度: BF16")
 
     # torch.compile 加速（PyTorch 2.0+）
     if USE_COMPILE and hasattr(torch, 'compile'):
@@ -298,11 +295,6 @@ def main():
         {'params': no_decay_params, 'weight_decay': 0.0}
     ], lr=LEARNING_RATE)
 
-    # 混合精度训练 (AMP)
-    scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    print(f"混合精度训练: {'BF16' if amp_dtype == torch.bfloat16 else 'FP16' if USE_AMP else '关闭'}")
-
     # ========== 评估函数 ==========
     @torch.no_grad()
     def estimate_loss():
@@ -328,7 +320,7 @@ def main():
     resume_path = f'{CHECKPOINT_DIR}/latest.pt'
 
     if RESUME and os.path.exists(resume_path):
-        start_iter, best_val_loss = load_checkpoint(resume_path, model, optimizer, scaler)
+        start_iter, best_val_loss = load_checkpoint(resume_path, model, optimizer)
         start_iter += 1
     else:
         # 测试初始状态
@@ -375,12 +367,12 @@ def main():
             # 保存最佳模型
             if SAVE_BEST and losses['test'] < best_val_loss:
                 best_val_loss = losses['test']
-                save_checkpoint(model, optimizer, scaler, iter_num, best_val_loss, vocab_size,
+                save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size,
                               f'{CHECKPOINT_DIR}/best.pt')
 
             # 定期保存 + 生成预测
             if iter_num > 0 and iter_num % SAVE_INTERVAL == 0:
-                save_checkpoint(model, optimizer, scaler, iter_num, best_val_loss, vocab_size,
+                save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size,
                               f'{CHECKPOINT_DIR}/ckpt_{iter_num}.pt')
 
                 # 每 1000 步生成一次预测
@@ -413,22 +405,19 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
 
-        # 混合精度前向传播
-        with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=amp_dtype):
-            logits, loss = model(xb, yb)
+        # 前向传播
+        _, loss = model(xb, yb)
 
-        # 混合精度反向传播
-        scaler.scale(loss).backward()
+        # 反向传播
+        loss.backward()
 
         # 梯度裁剪
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
 
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
     # ========== 保存最终模型 ==========
-    save_checkpoint(model, optimizer, scaler, TRAIN_ITERS - 1, best_val_loss, vocab_size,
+    save_checkpoint(model, optimizer, TRAIN_ITERS - 1, best_val_loss, vocab_size,
                    f'{CHECKPOINT_DIR}/latest.pt')
 
     # 最终评估

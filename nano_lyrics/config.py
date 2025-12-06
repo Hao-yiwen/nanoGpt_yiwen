@@ -48,8 +48,7 @@ NUM_WORKERS = 4          # 数据加载进程数
 PIN_MEMORY = True        # 锁页内存，加速 GPU 传输
 PREFETCH_FACTOR = 2      # 每个 worker 预取的 batch 数
 
-# 混合精度训练
-USE_AMP = True           # 开启混合精度训练
+# 编译加速
 USE_COMPILE = True       # 开启 torch.compile 加速（PyTorch 2.0+）
 
 # ============================================================================
