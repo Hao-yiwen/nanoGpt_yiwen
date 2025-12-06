@@ -11,3 +11,4 @@ checkpoints/
 *.tar.lzma
 *.tar.lz
 *.tar.lz4
+hf_upload/

@@ -1,6 +1,10 @@
 # NanoGPT 中文歌词版
 
+[![Hugging Face](https://img.shields.io/badge/Model-Hugging%20Face-yellow)](https://huggingface.co/yiwenX/nanogpt-chinese-lyrics)
+
 基于 Andrej Karpathy 的 NanoGPT，针对中文歌词生成进行优化的系列版本。
+
+**预训练模型**: [yiwenX/nanogpt-chinese-lyrics](https://huggingface.co/yiwenX/nanogpt-chinese-lyrics)
 
 ## 版本说明
 
