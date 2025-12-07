@@ -15,7 +15,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 
-from config import N_EMBED, N_HEADS, N_KV_HEADS, N_LAYERS, DROP_OUT, MAX_SEQ_LEN
+from config import (N_EMBED, N_HEADS, N_KV_HEADS, N_LAYERS, DROP_OUT, MAX_SEQ_LEN,
+                    USE_MOE, NUM_EXPERTS, NUM_SHARED_EXPERTS, TOP_K, AUX_LOSS_COEF)
 
 
 # ============================================================================
@@ -232,6 +233,141 @@ class FeedForward(nn.Module):
 
 
 # ============================================================================
+# MoE: Router 路由器
+# ============================================================================
+
+class Router(nn.Module):
+    """Top-K 路由器，带负载均衡损失"""
+
+    def __init__(self, n_embd, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(n_embd, num_experts, bias=False)
+
+    def forward(self, x):
+        # x: (B, T, C)
+        B, T, C = x.shape                                       # B=batch, T=seq_len, C=n_embd
+        x_flat = x.view(-1, C)                                  # (B*T, C)
+
+        # 计算路由分数
+        logits = self.gate(x_flat)                              # (B*T, num_experts)
+        probs = F.softmax(logits, dim=-1)                       # (B*T, num_experts)
+
+        # Top-K 选择
+        weights, indices = torch.topk(probs, self.top_k, dim=-1)  # (B*T, top_k), (B*T, top_k)
+        weights = weights / weights.sum(dim=-1, keepdim=True)   # (B*T, top_k) 归一化
+
+        # 计算负载均衡损失
+        # f_i: 每个专家被选中的 token 比例
+        mask = F.one_hot(indices, self.num_experts).sum(dim=1)  # (B*T, num_experts)
+        f = mask.float().mean(dim=0)                            # (num_experts,)
+        # P_i: 每个专家的平均路由概率
+        P = probs.mean(dim=0)                                   # (num_experts,)
+        aux_loss = self.num_experts * (f * P).sum()             # scalar
+
+        # 返回值:
+        # weights: (B*T, top_k) 每个 token 选中的专家权重（归一化后）
+        # indices: (B*T, top_k) 每个 token 选中的专家索引
+        # aux_loss: scalar 负载均衡辅助损失
+        return weights, indices, aux_loss
+
+
+# ============================================================================
+# MoE: MoELayer 混合专家层
+# ============================================================================
+
+class MoELayer(nn.Module):
+    """
+    Mixture of Experts 层 (带共享专家)
+    
+    架构:
+    - 共享专家 (Shared Experts): 处理所有 token，学习通用知识
+    - 路由专家 (Routed Experts): 根据 Router 选择性激活，学习专业知识
+    
+    输出 = 共享专家输出 + 路由专家加权输出
+    """
+
+    def __init__(self, n_embd, num_experts, num_shared_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        
+        # 路由专家 (Routed Experts)
+        self.experts = nn.ModuleList([FeedForward(n_embd) for _ in range(num_experts)])
+        self.router = Router(n_embd, num_experts, top_k)
+        
+        # 共享专家 (Shared Experts) - 如果 num_shared_experts > 0
+        if num_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                FeedForward(n_embd) for _ in range(num_shared_experts)
+            ])
+        else:
+            self.shared_experts = None
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)  # (B*T, C)
+
+        # ========== 共享专家计算 ==========
+        # 共享专家处理所有 token，不需要路由
+        shared_output = torch.zeros_like(x_flat)  # (B*T, C)
+        if self.shared_experts is not None:
+            for shared_expert in self.shared_experts:
+                shared_output += shared_expert(x_flat)  # 所有共享专家的输出相加
+
+        # ========== 路由专家计算 ==========
+        # 路由决定每个 token 去哪些专家
+        weights, indices, aux_loss = self.router(x)  # weights/indices: (B*T, top_k)
+
+        # 思路: 遍历每个专家，找到选择了该专家的 token，计算输出后加权累加
+        #
+        # 示例: 假设 top_k=2, num_experts=8, 有 4 个 token
+        # indices = [[0, 3],    # token 0 选了专家 0 和 3
+        #            [1, 0],    # token 1 选了专家 1 和 0
+        #            [0, 2],    # token 2 选了专家 0 和 2
+        #            [3, 1]]    # token 3 选了专家 3 和 1
+        # weights = [[0.6, 0.4],
+        #            [0.7, 0.3],
+        #            [0.5, 0.5],
+        #            [0.8, 0.2]]
+        #
+        # 当 i=0 (专家0) 时:
+        #   mask = [True, True, True, False]  # token 0,1,2 选了专家0
+        #   expert_weights = [0.6, 0.3, 0.5]  # 各 token 给专家0的权重
+
+        routed_output = torch.zeros_like(x_flat)  # (B*T, C) 初始化路由专家输出
+        for i, expert in enumerate(self.experts):
+            # 找到选择了这个专家的 token (在 top_k 个选择中任意位置出现即可)
+            mask = (indices == i).any(dim=-1)  # (B*T,) bool mask
+            if mask.any():
+                # 提取选中该专家的 token 输入
+                expert_input = x_flat[mask]       # (n, C) n=选中该专家的token数
+                expert_output = expert(expert_input)  # (n, C) 专家计算结果
+
+                # 获取这个专家的权重
+                # 1. 找到 indices 中等于 i 的位置，取对应的 weight，其他位置置 0
+                expert_weights = torch.where(
+                    indices == i,                 # (B*T, top_k) 条件
+                    weights,                      # 满足条件取 weights
+                    torch.zeros_like(weights)     # 不满足取 0
+                )  # (B*T, top_k)
+                # 2. 沿 top_k 维度求和（一个 token 最多在一个位置选中该专家）
+                # 3. 只保留 mask 为 True 的行
+                expert_weights = expert_weights.sum(dim=-1, keepdim=True)[mask]  # (n, 1)
+
+                # 加权累加到输出（一个 token 可能选了多个专家，所以是累加）
+                routed_output[mask] += expert_weights * expert_output  # (n, C)
+
+        # ========== 合并输出 ==========
+        # 最终输出 = 共享专家输出 + 路由专家输出
+        output = shared_output + routed_output
+
+        return output.view(B, T, C), aux_loss  # 恢复原始形状
+
+
+# ============================================================================
 # Transformer Block
 # ============================================================================
 
@@ -240,12 +376,17 @@ class Block(nn.Module):
     Transformer Block: 自注意力 + 前馈网络
 
     使用 Pre-LayerNorm 结构（先 LayerNorm 再计算）和残差连接
+    支持 MoE（Mixture of Experts）
     """
 
-    def __init__(self, n_embd, n_head, n_kv_heads=None):
+    def __init__(self, n_embd, n_head, n_kv_heads=None, use_moe=False):
         super().__init__()
+        self.use_moe = use_moe
         self.sa = CausalSelfAttention(n_embd, n_head, n_kv_heads)
-        self.ff = FeedForward(n_embd)
+        if use_moe:
+            self.ff = MoELayer(n_embd, NUM_EXPERTS, NUM_SHARED_EXPERTS, TOP_K)
+        else:
+            self.ff = FeedForward(n_embd)
         self.ln1 = RMSNorm(n_embd)
         self.ln2 = RMSNorm(n_embd)
 
@@ -253,8 +394,13 @@ class Block(nn.Module):
         # 残差连接：x = x + sublayer(LayerNorm(x))
         h, new_kv_cache = self.sa(self.ln1(x), start_pos, kv_cache)
         x = x + h
-        x = x + self.ff(self.ln2(x))
-        return x, new_kv_cache
+        if self.use_moe:
+            ff_out, aux_loss = self.ff(self.ln2(x))
+            x = x + ff_out
+            return x, new_kv_cache, aux_loss
+        else:
+            x = x + self.ff(self.ln2(x))
+            return x, new_kv_cache
 
 
 # ============================================================================
@@ -275,12 +421,19 @@ class GPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
         self.vocab_size = vocab_size
+        self.use_moe = USE_MOE  # 保存配置供 forward 使用
 
         # Token 嵌入 (使用 RoPE，不需要位置嵌入)
         self.token_embedding_table = nn.Embedding(vocab_size, N_EMBED)
 
         # Transformer 层（使用 GQA + KV Cache）
-        self.blocks = nn.ModuleList([Block(N_EMBED, N_HEADS, N_KV_HEADS) for _ in range(N_LAYERS)])
+        # MoE: 交替层使用（奇数层：1, 3, 5, 7, 9, 11）
+        from config import MOE_FREQ
+        self.blocks = nn.ModuleList([
+            Block(N_EMBED, N_HEADS, N_KV_HEADS,
+                  use_moe=(USE_MOE and i % MOE_FREQ == 1))
+            for i in range(N_LAYERS)
+        ])
         self.ln_f = RMSNorm(N_EMBED)  # 最终的 RMSNorm
 
         # 输出头：将嵌入映射到词汇表大小
@@ -328,9 +481,15 @@ class GPTLanguageModel(nn.Module):
 
         # Transformer 处理（逐层传递 KV Cache）
         new_kv_caches = []
+        total_aux_loss = 0.0
+
         for i, block in enumerate(self.blocks):
             kv_cache = kv_caches[i] if kv_caches is not None else None
-            x, new_kv_cache = block(x, start_pos, kv_cache)
+            if block.use_moe:
+                x, new_kv_cache, aux_loss = block(x, start_pos, kv_cache)
+                total_aux_loss += aux_loss
+            else:
+                x, new_kv_cache = block(x, start_pos, kv_cache)
             new_kv_caches.append(new_kv_cache)
 
         x = self.ln_f(x)
@@ -343,9 +502,15 @@ class GPTLanguageModel(nn.Module):
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
+            logits_flat = logits.view(B * T, C)
+            targets_flat = targets.view(B * T)
+            ce_loss = F.cross_entropy(logits_flat, targets_flat)
+
+            # 仅当使用 MoE 时添加辅助损失
+            if self.use_moe:
+                loss = ce_loss + AUX_LOSS_COEF * total_aux_loss
+            else:
+                loss = ce_loss
 
         return logits, loss, new_kv_caches
 
