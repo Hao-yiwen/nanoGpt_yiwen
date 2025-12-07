@@ -28,7 +28,7 @@ from config import (
 # 延迟导入 swanlab（仅在需要时）
 swanlab = None
 from model import GPTLanguageModel
-from tokenizer import train_bpe_tokenizer, encode, decode, get_bos_id
+from tokenizer import train_bpe_tokenizer, encode, decode, get_bos_id, get_vocab_size, get_pad_id
 
 
 # ============================================================================
@@ -216,20 +216,20 @@ def main():
     print(f"数据预览:\n{text[:500]}...")
 
     # ========== 训练/加载 tokenizer ==========
-    sp = train_bpe_tokenizer(text)
-    vocab_size = sp.get_piece_size()
-    pad_id = sp.piece_to_id('<pad>') if sp.piece_to_id('<pad>') != sp.unk_id() else sp.unk_id()
+    tokenizer = train_bpe_tokenizer(text)
+    vocab_size = get_vocab_size(tokenizer)
+    pad_id = get_pad_id(tokenizer)
     print(f"\nBPE 词汇表大小: {vocab_size}")
     print(f"PAD token id: {pad_id}")
 
     # 测试 tokenizer
     test_text = "我爱你"
-    test_encoded = encode(test_text, sp)
-    test_decoded = decode(test_encoded, sp)
+    test_encoded = encode(test_text, tokenizer)
+    test_decoded = decode(test_encoded, tokenizer)
     print(f"分词测试: '{test_text}' -> {test_encoded} -> '{test_decoded}'")
 
     # 将每首歌单独编码为 token 列表
-    all_samples = [encode(lyric, sp) for lyric in processed_lyrics]
+    all_samples = [encode(lyric, tokenizer) for lyric in processed_lyrics]
 
     # 统计歌曲长度分布
     lengths = [len(s) for s in all_samples]
@@ -385,8 +385,8 @@ def main():
         print("\n" + "=" * 50)
         print("训练前生成的文本:")
         print("=" * 50)
-        context = torch.tensor([encode(GENERATE_PROMPT, sp)], dtype=torch.long, device=DEVICE)
-        print(decode(model.generate(context, max_new_tokens=INITIAL_GENERATE_TOKENS)[0].tolist(), sp))
+        context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
+        print(decode(model.generate(context, max_new_tokens=INITIAL_GENERATE_TOKENS)[0].tolist(), tokenizer))
 
     # ========== 训练循环 ==========
     print("\n" + "=" * 50)
@@ -429,9 +429,9 @@ def main():
                 # 每 1000 步生成一次预测
                 model.eval()
                 with torch.no_grad():
-                    context = torch.tensor([encode(GENERATE_PROMPT, sp)], dtype=torch.long, device=DEVICE)
+                    context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
                     generated = model.generate(context, max_new_tokens=100)[0].tolist()
-                    generated_text = decode(generated, sp)
+                    generated_text = decode(generated, tokenizer)
                     print(f"\n--- Step {iter_num} 生成预览 ---")
                     print(generated_text)
                     print("-" * 30 + "\n")
@@ -495,8 +495,8 @@ def main():
     print("\n" + "=" * 50)
     print("训练后生成的文本:")
     print("=" * 50)
-    context = torch.tensor([encode(GENERATE_PROMPT, sp)], dtype=torch.long, device=DEVICE)
-    final_generated = decode(model.generate(context, max_new_tokens=FINAL_GENERATE_TOKENS)[0].tolist(), sp)
+    context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
+    final_generated = decode(model.generate(context, max_new_tokens=FINAL_GENERATE_TOKENS)[0].tolist(), tokenizer)
     print(final_generated)
 
     # 记录最终生成到 swanlab

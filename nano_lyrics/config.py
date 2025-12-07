@@ -13,9 +13,17 @@ import torch
 
 LYRICS_DIR = '../ChineseLyrics'           # 歌词数据目录（相对于 final_train/）
 BPE_VOCAB_SIZE = 10000                     # BPE 词汇表大小
-BPE_MODEL_PREFIX = 'chinese_lyrics_bpe'   # BPE 模型文件前缀
+BPE_MODEL_PATH = 'chinese_lyrics_bpe.json' # BPE 模型文件路径
 MAX_SONGS = 102197                         # 加载的歌曲数量
 RANDOM_SEED = 1337
+
+# ChatML 特殊 token 配置
+SPECIAL_TOKENS = {
+    "pad_token": "<|pad|>",
+    "eos_token": "<|endoftext|>",
+    "im_start_token": "<|im_start|>",
+    "im_end_token": "<|im_end|>",
+}
 
 # ============================================================================
 # 模型架构 (GPT-2 Small 规格)
