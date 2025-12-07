@@ -4,7 +4,8 @@
       "Bash(ls:*)",
       "Bash(python3:*)",
       "Bash(hf repo create:*)",
-      "Bash(hf upload:*)"
+      "Bash(hf upload:*)",
+      "mcp__ide__getDiagnostics"
     ],
     "deny": [],
     "ask": []

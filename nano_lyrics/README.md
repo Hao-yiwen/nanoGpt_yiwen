@@ -72,7 +72,7 @@ python inference.py
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `BATCH_SIZE` | 64 | 批大小（根据显存调整） |
-| `BLOCK_SIZE` | 1024 | 上下文长度 |
+| `MAX_SEQ_LEN` | 1024 | 最大序列长度 |
 | `LEARNING_RATE` | 3e-4 | 最大学习率 |
 | `TRAIN_ITERS` | 2000 | 训练迭代次数 |
 | `N_EMBED` | 768 | 嵌入维度 |
@@ -128,9 +128,9 @@ python inference.py --prompt "我们的" --max_tokens 500
 
 | 配置 | 显存需求 |
 |------|----------|
-| BATCH_SIZE=64, BLOCK_SIZE=1024 | ~24GB |
-| BATCH_SIZE=32, BLOCK_SIZE=1024 | ~16GB |
-| BATCH_SIZE=16, BLOCK_SIZE=512 | ~8GB |
+| BATCH_SIZE=64, MAX_SEQ_LEN=1024 | ~24GB |
+| BATCH_SIZE=32, MAX_SEQ_LEN=1024 | ~16GB |
+| BATCH_SIZE=16, MAX_SEQ_LEN=512 | ~8GB |
 
 ## 数据
 

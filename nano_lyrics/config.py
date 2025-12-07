@@ -23,6 +23,7 @@ RANDOM_SEED = 1337
 
 N_EMBED = 768            # 嵌入维度
 N_HEADS = 12             # 注意力头数 (768 / 12 = 64, 偶数满足 RoPE)
+N_KV_HEADS = 4           # GQA 的 KV 头数（必须能整除 N_HEADS，可选: 1, 2, 3, 4, 6, 12）
 N_LAYERS = 12            # Transformer Block 层数
 DROP_OUT = 0.1           # Dropout 比率
 
@@ -31,7 +32,7 @@ DROP_OUT = 0.1           # Dropout 比率
 # ============================================================================
 
 BATCH_SIZE = 64          # 每批样本数
-BLOCK_SIZE = 1024        # 最大上下文长度（序列长度）
+MAX_SEQ_LEN = 1024       # 最大序列长度（上下文长度）
 LEARNING_RATE = 3e-4     # 最大学习率
 MIN_LR = 3e-5            # 最小学习率 (LEARNING_RATE 的 1/10)
 WARMUP_ITERS = 200       # 预热迭代次数（10%）

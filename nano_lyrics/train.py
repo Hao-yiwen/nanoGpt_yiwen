@@ -6,6 +6,7 @@ NanoGPT 训练脚本
 """
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import json
 import re
@@ -14,7 +15,7 @@ import math
 
 from config import (
     LYRICS_DIR, MAX_SONGS, RANDOM_SEED,
-    BATCH_SIZE, BLOCK_SIZE, LEARNING_RATE, MIN_LR, WARMUP_ITERS, TRAIN_ITERS,
+    BATCH_SIZE, MAX_SEQ_LEN, LEARNING_RATE, MIN_LR, WARMUP_ITERS, TRAIN_ITERS,
     EVAL_ITERS, EVAL_INTERVAL, WEIGHT_DECAY, GRAD_CLIP,
     NUM_WORKERS, PIN_MEMORY, PREFETCH_FACTOR,
     USE_COMPILE,
@@ -83,19 +84,39 @@ def preprocess_lyric(lyric_lines):
 # ============================================================================
 
 class LyricsDataset(Dataset):
-    """歌词数据集"""
+    """歌词数据集（按歌曲切分，支持 loss_mask）"""
 
-    def __init__(self, data, block_size):
-        self.data = data
+    def __init__(self, samples, block_size, pad_id):
+        """
+        Args:
+            samples: List[List[int]], 每首歌的 token ids
+            block_size: 最大序列长度
+            pad_id: padding token id
+        """
+        self.samples = samples
         self.block_size = block_size
+        self.pad_id = pad_id
 
     def __len__(self):
-        return len(self.data) - self.block_size
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        x = self.data[idx : idx + self.block_size]
-        y = self.data[idx + 1 : idx + self.block_size + 1]
-        return x, y
+        tokens = self.samples[idx].copy()
+
+        # 截断或填充到 block_size + 1（因为需要 x 和 y 各 block_size 长度）
+        if len(tokens) > self.block_size + 1:
+            tokens = tokens[:self.block_size + 1]
+        else:
+            tokens = tokens + [self.pad_id] * (self.block_size + 1 - len(tokens))
+
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        x = tokens[:-1]  # (block_size,)
+        y = tokens[1:]   # (block_size,)
+
+        # loss_mask: 1 表示计算 loss，0 表示忽略（padding 位置）
+        loss_mask = (y != self.pad_id).long()
+
+        return x, y, loss_mask
 
 
 # ============================================================================
@@ -117,7 +138,7 @@ def save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size, path)
             'n_embed': 768,
             'n_heads': 12,
             'n_layers': 12,
-            'block_size': BLOCK_SIZE,
+            'max_seq_len': MAX_SEQ_LEN,
             'batch_size': BATCH_SIZE,
         }
     }
@@ -177,13 +198,19 @@ def main():
     lyrics_data = load_lyrics()
     print(f"加载了 {len(lyrics_data)} 首歌曲")
 
-    # 合并所有歌词为文本
-    text = '\n\n'.join(
+    # 预处理每首歌的歌词
+    processed_lyrics = [
         preprocess_lyric(song['lyric'])
         for song in lyrics_data
         if song.get('lyric')
-    )
+    ]
+    # 过滤空歌词
+    processed_lyrics = [lyric for lyric in processed_lyrics if lyric.strip()]
 
+    # 合并所有歌词用于训练 tokenizer
+    text = '\n\n'.join(processed_lyrics)
+
+    print(f"有效歌曲数: {len(processed_lyrics):,}")
     print(f"数据集字符数: {len(text):,}")
     print(f"原始唯一字符数: {len(set(text)):,}")
     print(f"数据预览:\n{text[:500]}...")
@@ -191,7 +218,9 @@ def main():
     # ========== 训练/加载 tokenizer ==========
     sp = train_bpe_tokenizer(text)
     vocab_size = sp.get_piece_size()
+    pad_id = sp.piece_to_id('<pad>') if sp.piece_to_id('<pad>') != sp.unk_id() else sp.unk_id()
     print(f"\nBPE 词汇表大小: {vocab_size}")
+    print(f"PAD token id: {pad_id}")
 
     # 测试 tokenizer
     test_text = "我爱你"
@@ -199,19 +228,28 @@ def main():
     test_decoded = decode(test_encoded, sp)
     print(f"分词测试: '{test_text}' -> {test_encoded} -> '{test_decoded}'")
 
-    # 数据转为张量并分割
-    data = torch.tensor(encode(text, sp), dtype=torch.long)
-    n = int(0.9 * len(data))
-    train_data = data[:n]
-    test_data = data[n:]
-    print(f"\n训练集大小: {len(train_data):,} tokens | 测试集大小: {len(test_data):,} tokens")
+    # 将每首歌单独编码为 token 列表
+    all_samples = [encode(lyric, sp) for lyric in processed_lyrics]
+
+    # 统计歌曲长度分布
+    lengths = [len(s) for s in all_samples]
+    print(f"\n歌曲长度统计: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
+
+    # 分割训练集和测试集（按歌曲数量）
+    n = int(0.9 * len(all_samples))
+    train_samples = all_samples[:n]
+    test_samples = all_samples[n:]
+    train_tokens = sum(len(s) for s in train_samples)
+    test_tokens = sum(len(s) for s in test_samples)
+    print(f"训练集: {len(train_samples):,} 首歌 ({train_tokens:,} tokens)")
+    print(f"测试集: {len(test_samples):,} 首歌 ({test_tokens:,} tokens)")
 
     # 设置随机种子
     torch.manual_seed(RANDOM_SEED)
 
     # ========== 创建 DataLoader ==========
-    train_dataset = LyricsDataset(train_data, BLOCK_SIZE)
-    test_dataset = LyricsDataset(test_data, BLOCK_SIZE)
+    train_dataset = LyricsDataset(train_samples, MAX_SEQ_LEN, pad_id)
+    test_dataset = LyricsDataset(test_samples, MAX_SEQ_LEN, pad_id)
 
     train_loader = DataLoader(
         train_dataset,
@@ -245,7 +283,7 @@ def main():
             experiment_name=run_name,
             config={
                 'batch_size': BATCH_SIZE,
-                'block_size': BLOCK_SIZE,
+                'max_seq_len': MAX_SEQ_LEN,
                 'learning_rate': LEARNING_RATE,
                 'min_lr': MIN_LR,
                 'warmup_iters': WARMUP_ITERS,
@@ -257,8 +295,8 @@ def main():
                 'weight_decay': WEIGHT_DECAY,
                 'grad_clip': GRAD_CLIP,
                 'vocab_size': vocab_size,
-                'train_tokens': len(train_data),
-                'test_tokens': len(test_data),
+                'train_tokens': train_tokens,
+                'test_tokens': test_tokens,
             }
         )
         print(f"Swanlab 初始化完成: {run_name}")
@@ -298,17 +336,24 @@ def main():
     # ========== 评估函数 ==========
     @torch.no_grad()
     def estimate_loss():
-        """在训练集和测试集上估计平均损失"""
+        """在训练集和测试集上估计平均损失（带 loss_mask）"""
         out = {}
         model.eval()
         for split, loader in [('train', train_loader), ('test', test_loader)]:
             losses = []
-            for i, (X, Y) in enumerate(loader):
+            for i, (X, Y, loss_mask) in enumerate(loader):
                 if i >= EVAL_ITERS:
                     break
                 X = X.to(DEVICE, non_blocking=True)
                 Y = Y.to(DEVICE, non_blocking=True)
-                _, loss = model(X, Y)
+                loss_mask = loss_mask.to(DEVICE, non_blocking=True)
+
+                logits, _, _ = model(X)
+                B, T, C = logits.shape
+                loss_per_token = F.cross_entropy(
+                    logits.view(B * T, C), Y.view(B * T), reduction='none'
+                ).view(B, T)
+                loss = (loss_per_token * loss_mask).sum() / loss_mask.sum()
                 losses.append(loss.item())
             out[split] = sum(losses) / len(losses) if losses else 0.0
         model.train()
@@ -325,9 +370,15 @@ def main():
     else:
         # 测试初始状态
         test_iter = iter(train_loader)
-        xb, yb = next(test_iter)
+        xb, yb, loss_mask_init = next(test_iter)
         xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        logits, loss = model(xb, yb)
+        loss_mask_init = loss_mask_init.to(DEVICE)
+        logits, _, _ = model(xb)
+        B, T, C = logits.shape
+        loss_per_token = F.cross_entropy(
+            logits.view(B * T, C), yb.view(B * T), reduction='none'
+        ).view(B, T)
+        loss = (loss_per_token * loss_mask_init).sum() / loss_mask_init.sum()
         print(f"初始 loss: {loss:.4f}")
 
         # 训练前生成
@@ -395,18 +446,24 @@ def main():
 
         # 获取批次（循环重用）
         try:
-            xb, yb = next(train_iter)
+            xb, yb, loss_mask = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            xb, yb = next(train_iter)
+            xb, yb, loss_mask = next(train_iter)
 
         xb = xb.to(DEVICE, non_blocking=True)
         yb = yb.to(DEVICE, non_blocking=True)
+        loss_mask = loss_mask.to(DEVICE, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # 前向传播
-        _, loss = model(xb, yb)
+        # 前向传播（带 loss_mask）
+        logits, _, _ = model(xb)
+        B, T, C = logits.shape
+        loss_per_token = F.cross_entropy(
+            logits.view(B * T, C), yb.view(B * T), reduction='none'
+        ).view(B, T)
+        loss = (loss_per_token * loss_mask).sum() / loss_mask.sum()
 
         # 反向传播
         loss.backward()
