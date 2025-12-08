@@ -89,12 +89,13 @@ GENERATE_PROMPT = "今夜我"       # 默认生成提示词
 DEFAULT_MAX_TOKENS = 200
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.9
+DEFAULT_REPETITION_PENALTY = 1.2
 
 # ============================================================================
 # MoE 配置
 # ============================================================================
 
-USE_MOE = True               # 是否启用 MoE（False 则使用原始 FeedForward）
+USE_MOE = False               # 是否启用 MoE（False 则使用原始 FeedForward）
 NUM_EXPERTS = 8              # 路由专家数量
 NUM_SHARED_EXPERTS = 1       # 共享专家数量（0=不使用共享专家）
 TOP_K = 1                    # 每个 token 激活的路由专家数

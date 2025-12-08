@@ -19,6 +19,7 @@ from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
 from transformers import PretrainedConfig, PreTrainedModel
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -47,7 +48,7 @@ class NanoGPTConfig(PretrainedConfig):
         use_moe: bool = False,
         num_experts: int = 8,
         num_shared_experts: int = 1,
-        top_k: int = 1,
+        moe_top_k: int = 1,
         moe_freq: int = 2,
         aux_loss_coef: float = 0.01,
         # HF 兼容参数
@@ -69,13 +70,14 @@ class NanoGPTConfig(PretrainedConfig):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.n_layers = n_layers
+        self.num_hidden_layers = n_layers  # HF 兼容别名
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         # MoE 配置
         self.use_moe = use_moe
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
-        self.top_k = top_k
+        self.moe_top_k = moe_top_k
         self.moe_freq = moe_freq
         self.aux_loss_coef = aux_loss_coef
 
@@ -202,11 +204,12 @@ class CausalSelfAttention(nn.Module):
         sin = sin[start_pos:seq_len]
         q, k = self._apply_rope(q, k, cos, sin)
 
-        # KV Cache 处理
+        # KV Cache 处理（兼容新版 DynamicCache）
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
-            k = torch.cat([k_cache, k], dim=2)
-            v = torch.cat([v_cache, v], dim=2)
+            if k_cache is not None and v_cache is not None:
+                k = torch.cat([k_cache, k], dim=2)
+                v = torch.cat([v_cache, v], dim=2)
 
         # 保存新的缓存（未扩展的 K/V）
         new_kv_cache = (k, v)
@@ -257,8 +260,8 @@ class CausalSelfAttention(nn.Module):
         """对多头 Q、K 应用 RoPE"""
         # q: (B, n_head, T, head_dim), k: (B, n_kv_heads, T, head_dim)
         # cos, sin: (T, head_dim)
-        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
-        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos = cos.unsqueeze(0).unsqueeze(0).to(q.dtype)  # (1, 1, T, head_dim)
+        sin = sin.unsqueeze(0).unsqueeze(0).to(q.dtype)
 
         def rotate_half(x):
             x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -333,10 +336,10 @@ class FeedForward(nn.Module):
 class Router(nn.Module):
     """Top-K 路由器，带负载均衡损失"""
 
-    def __init__(self, n_embd, num_experts, top_k):
+    def __init__(self, n_embd, num_experts, moe_top_k):
         super().__init__()
         self.num_experts = num_experts
-        self.top_k = top_k
+        self.moe_top_k = moe_top_k
         self.gate = nn.Linear(n_embd, num_experts, bias=False)
 
     def forward(self, x):
@@ -349,7 +352,7 @@ class Router(nn.Module):
         probs = F.softmax(logits, dim=-1)                       # (B*T, num_experts)
 
         # Top-K 选择
-        weights, indices = torch.topk(probs, self.top_k, dim=-1)  # (B*T, top_k), (B*T, top_k)
+        weights, indices = torch.topk(probs, self.moe_top_k, dim=-1)  # (B*T, top_k), (B*T, top_k)
         weights = weights / weights.sum(dim=-1, keepdim=True)   # (B*T, top_k) 归一化
 
         # 计算负载均衡损失
@@ -387,15 +390,15 @@ class MoELayer(nn.Module):
         n_embd = config.n_embed
         num_experts = config.num_experts
         num_shared_experts = config.num_shared_experts
-        top_k = config.top_k
+        moe_top_k = config.moe_top_k
 
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
-        self.top_k = top_k
+        self.moe_top_k = moe_top_k
 
         # 路由专家 (Routed Experts)
         self.experts = nn.ModuleList([FeedForward(config) for _ in range(num_experts)])
-        self.router = Router(n_embd, num_experts, top_k)
+        self.router = Router(n_embd, num_experts, moe_top_k)
 
         # 共享专家 (Shared Experts) - 如果 num_shared_experts > 0
         if num_shared_experts > 0:
@@ -509,9 +512,9 @@ class Block(nn.Module):
 # 主模型定义 (HuggingFace 兼容)
 # ============================================================================
 
-class GPTLanguageModel(PreTrainedModel):
+class GPTLanguageModel(PreTrainedModel, GenerationMixin):
     """
-    GPT 风格的语言模型，继承自 HuggingFace PreTrainedModel
+    GPT 风格的语言模型，继承自 HuggingFace PreTrainedModel 和 GenerationMixin
 
     特性：
     - GQA 分组查询注意力 + Flash Attention
@@ -522,9 +525,10 @@ class GPTLanguageModel(PreTrainedModel):
     - 兼容 HuggingFace generate()
     """
     config_class = NanoGPTConfig
-    base_model_prefix = "model"
+    # base_model_prefix = "model"  # 移除无效的 prefix，因为是扁平结构
     supports_gradient_checkpointing = True
     _no_split_modules = ["Block"]
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: NanoGPTConfig):
         super().__init__(config)
@@ -613,10 +617,12 @@ class GPTLanguageModel(PreTrainedModel):
         B, T = input_ids.shape
 
         # 计算 start_pos（用于 RoPE 和 KV Cache）
-        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
-            start_pos = past_key_values[0][0].shape[2]  # cache_len
-        else:
-            start_pos = 0
+        start_pos = 0
+        if past_key_values is not None and len(past_key_values) > 0:
+            first_layer = past_key_values[0]
+            # 兼容新版 DynamicCache：检查 first_layer 是否有效
+            if first_layer is not None and len(first_layer) > 0 and first_layer[0] is not None:
+                start_pos = first_layer[0].shape[2]  # cache_len
 
         # 嵌入 (RoPE 在注意力层内部应用)
         tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
@@ -627,7 +633,10 @@ class GPTLanguageModel(PreTrainedModel):
         total_aux_loss = 0.0
 
         for i, block in enumerate(self.blocks):
-            kv_cache = past_key_values[i] if past_key_values is not None else None
+            # 安全获取 kv_cache（兼容 DynamicCache）
+            kv_cache = None
+            if past_key_values is not None and i < len(past_key_values):
+                kv_cache = past_key_values[i]
             if block.use_moe:
                 x, new_kv_cache, aux_loss = block(x, attention_mask, start_pos, kv_cache)
                 total_aux_loss += aux_loss
@@ -687,15 +696,18 @@ class GPTLanguageModel(PreTrainedModel):
         当使用 KV Cache 时，只需要传入最后一个 token
         """
         # 如果有 past_key_values，只取最后一个 token
-        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
-            # 检查缓存长度，避免超过 max_seq_len
-            cache_len = past_key_values[0][0].shape[2]
-            if cache_len >= self.config.max_seq_len:
-                # 截断缓存
-                past_key_values = [
-                    (k[:, :, 1:, :], v[:, :, 1:, :]) for k, v in past_key_values
-                ]
-            input_ids = input_ids[:, -1:]
+        if past_key_values is not None and len(past_key_values) > 0:
+            first_layer = past_key_values[0]
+            # 检查 first_layer 是否有效（兼容新版 DynamicCache）
+            if first_layer is not None and len(first_layer) > 0 and first_layer[0] is not None:
+                # 检查缓存长度，避免超过 max_seq_len
+                cache_len = first_layer[0].shape[2]
+                if cache_len >= self.config.max_seq_len:
+                    # 截断缓存
+                    past_key_values = [
+                        (k[:, :, 1:, :], v[:, :, 1:, :]) for k, v in past_key_values
+                    ]
+                input_ids = input_ids[:, -1:]
 
         return {
             "input_ids": input_ids,
@@ -710,10 +722,14 @@ class GPTLanguageModel(PreTrainedModel):
         """
         reordered_past = []
         for layer_past in past_key_values:
-            reordered_past.append(
-                tuple(
-                    past_state.index_select(0, beam_idx.to(past_state.device))
-                    for past_state in layer_past
+            if layer_past is None:
+                reordered_past.append(None)
+            else:
+                reordered_past.append(
+                    tuple(
+                        past_state.index_select(0, beam_idx.to(past_state.device))
+                        if past_state is not None else None
+                        for past_state in layer_past
+                    )
                 )
-            )
         return reordered_past

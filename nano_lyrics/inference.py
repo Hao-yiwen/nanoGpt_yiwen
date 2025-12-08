@@ -13,7 +13,7 @@ from transformers import PreTrainedTokenizerFast
 
 from config import (
     CHECKPOINT_DIR, DEVICE,
-    DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
+    DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_REPETITION_PENALTY,
 )
 from model import GPTLanguageModel, NanoGPTConfig
 
@@ -48,7 +48,8 @@ def load_model(model_path):
 
 
 def generate(model, tokenizer, prompt, max_tokens=DEFAULT_MAX_TOKENS,
-             temperature=DEFAULT_TEMPERATURE, top_p=DEFAULT_TOP_P):
+             temperature=DEFAULT_TEMPERATURE, top_p=DEFAULT_TOP_P,
+             repetition_penalty=DEFAULT_REPETITION_PENALTY):
     """
     生成文本
 
@@ -67,7 +68,7 @@ def generate(model, tokenizer, prompt, max_tokens=DEFAULT_MAX_TOKENS,
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(DEVICE)
 
     print(f"Prompt: {prompt}")
-    print(f"参数: max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}")
+    print(f"参数: max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, repetition_penalty={repetition_penalty}")
     print("-" * 50)
 
     # 使用 HuggingFace generate() API
@@ -78,6 +79,7 @@ def generate(model, tokenizer, prompt, max_tokens=DEFAULT_MAX_TOKENS,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -129,6 +131,8 @@ def main():
                         help=f'温度参数 (默认: {DEFAULT_TEMPERATURE})')
     parser.add_argument('--top_p', type=float, default=DEFAULT_TOP_P,
                         help=f'Top-p 采样阈值 (默认: {DEFAULT_TOP_P})')
+    parser.add_argument('--repetition_penalty', type=float, default=DEFAULT_REPETITION_PENALTY,
+                        help=f'重复惩罚系数 (默认: {DEFAULT_REPETITION_PENALTY})')
 
     args = parser.parse_args()
 
@@ -144,6 +148,7 @@ def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
         )
         print("\n生成结果:")
         print(result)

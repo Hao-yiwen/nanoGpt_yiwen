@@ -11,6 +11,9 @@ from torch.utils.data import DataLoader
 import os
 import math
 
+# 禁用 tokenizers 的并行化，避免在 DataLoader 中产生死锁警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from transformers import PreTrainedTokenizerFast, GenerationConfig
 
 from config import (
@@ -67,7 +70,7 @@ def save_model_hf(model, tokenizer, save_path, optimizer_state=None, iter_num=No
     model_to_save = model._orig_mod if hasattr(model, '_orig_mod') else model
 
     # 保存模型和配置（使用 safetensors 格式）
-    model_to_save.save_pretrained(save_path, safe_serialization=True)
+    model_to_save.save_pretrained(save_path)
 
     # 创建 HF tokenizer 并保存
     hf_tokenizer = PreTrainedTokenizerFast(
@@ -286,7 +289,7 @@ def main():
         use_moe=USE_MOE,
         num_experts=NUM_EXPERTS,
         num_shared_experts=NUM_SHARED_EXPERTS,
-        top_k=TOP_K,
+        moe_top_k=TOP_K,
         moe_freq=MOE_FREQ,
         aux_loss_coef=AUX_LOSS_COEF,
         # HF 兼容参数
