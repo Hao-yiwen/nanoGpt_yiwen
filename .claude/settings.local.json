@@ -5,7 +5,8 @@
       "Bash(python3:*)",
       "Bash(hf repo create:*)",
       "Bash(hf upload:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(conda env list:*)"
     ],
     "deny": [],
     "ask": []

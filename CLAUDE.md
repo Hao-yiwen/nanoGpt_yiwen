@@ -1,0 +1,3 @@
+1. Use UTF-8 encoding when updating or writing documents; otherwise, you may encounter write failures or garbled text issues.
+2. File searches must be executed directly—never delegate them to the task tool or explore agent. While this may result in longer context, it significantly improves search accuracy.
+3. Before solving the problem, if the topic I raise does not match the current context file, or if there is a need for further exploration, you may try to consult other relevant files.

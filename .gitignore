@@ -12,3 +12,9 @@ checkpoints/
 *.tar.lz
 *.tar.lz4
 hf_upload/
+
+__pycache__/
+.DS_Store
+.idea/
+.vscode/
+.env
