@@ -3,20 +3,81 @@
 NanoGPT 模型定义
 
 包含:
+- NanoGPTConfig (HuggingFace 兼容配置)
 - RotaryPositionalEmbedding (RoPE)
 - CausalSelfAttention (GQA + KV Cache + Flash Attention)
 - FeedForward
 - Block
-- GPTLanguageModel
+- GPTLanguageModel (继承自 PreTrainedModel)
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
 
-from config import (N_EMBED, N_HEADS, N_KV_HEADS, N_LAYERS, DROP_OUT, MAX_SEQ_LEN,
-                    USE_MOE, NUM_EXPERTS, NUM_SHARED_EXPERTS, TOP_K, AUX_LOSS_COEF)
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+# ============================================================================
+# NanoGPT 配置类 (HuggingFace 兼容)
+# ============================================================================
+
+class NanoGPTConfig(PretrainedConfig):
+    """
+    NanoGPT 模型配置类，继承自 HuggingFace PretrainedConfig。
+
+    支持通过 config.json 保存和加载配置。
+    """
+    model_type = "nanogpt"
+
+    def __init__(
+        self,
+        vocab_size: int = 10000,
+        n_embed: int = 768,
+        n_heads: int = 12,
+        n_kv_heads: int = 4,
+        n_layers: int = 12,
+        max_seq_len: int = 1024,
+        dropout: float = 0.1,
+        # MoE 配置
+        use_moe: bool = False,
+        num_experts: int = 8,
+        num_shared_experts: int = 1,
+        top_k: int = 1,
+        moe_freq: int = 2,
+        aux_loss_coef: float = 0.01,
+        # HF 兼容参数
+        pad_token_id: int = 0,
+        bos_token_id: int = 2,
+        eos_token_id: int = 1,
+        tie_word_embeddings: bool = True,
+        **kwargs
+    ):
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs
+        )
+        self.vocab_size = vocab_size
+        self.n_embed = n_embed
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_layers = n_layers
+        self.max_seq_len = max_seq_len
+        self.dropout = dropout
+        # MoE 配置
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.moe_freq = moe_freq
+        self.aux_loss_coef = aux_loss_coef
 
 
 # ============================================================================
@@ -46,8 +107,12 @@ class RMSNorm(nn.Module):
 class RotaryPositionalEmbedding(nn.Module):
     """RoPE 旋转位置编码"""
 
-    def __init__(self, dim, max_seq_len=MAX_SEQ_LEN, base=10000):
+    def __init__(self, dim: int, max_seq_len: int, base: int = 10000):
         super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
         # 计算频率 θ_i = base^(-2i/d)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
@@ -59,7 +124,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer('cos_cached', emb.cos())
         self.register_buffer('sin_cached', emb.sin())
 
-    def forward(self, seq_len):
+    def forward(self, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 
@@ -70,8 +135,12 @@ class RotaryPositionalEmbedding(nn.Module):
 class CausalSelfAttention(nn.Module):
     """分组查询注意力 GQA（带 RoPE + Flash Attention）"""
 
-    def __init__(self, n_embd, n_head, n_kv_heads=None):
+    def __init__(self, config: NanoGPTConfig):
         super().__init__()
+        n_embd = config.n_embed
+        n_head = config.n_heads
+        n_kv_heads = config.n_kv_heads
+
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_head
@@ -86,13 +155,13 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = nn.Linear(n_embd, self.n_kv_heads * self.head_dim, bias=False)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
 
-        self.resid_dropout = nn.Dropout(DROP_OUT)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
         # 单个共享的 RoPE 实例
-        self.rope = RotaryPositionalEmbedding(self.head_dim)
+        self.rope = RotaryPositionalEmbedding(self.head_dim, config.max_seq_len)
 
         # Flash Attention 的 dropout 比率
-        self.dropout = DROP_OUT
+        self.dropout = config.dropout
 
     def _repeat_kv(self, x, n_rep):
         """将 KV 头扩展以匹配 Q 头数量"""
@@ -102,10 +171,12 @@ class CausalSelfAttention(nn.Module):
         x = x[:, :, None, :, :].expand(B, n_kv_heads, n_rep, T, head_dim)
         return x.reshape(B, n_kv_heads * n_rep, T, head_dim)
 
-    def forward(self, x, start_pos=0, kv_cache=None):
+    def forward(self, x, attention_mask=None, start_pos=0, kv_cache=None):
         """
         Args:
             x: 输入 (B, T, C)
+            attention_mask: 注意力掩码 (B, S)，1 表示有效，0 表示忽略（padding）
+                           S 是完整序列长度（包括 KV cache）
             start_pos: 当前位置索引（用于 RoPE 和 KV Cache）
             kv_cache: 缓存的 (k, v)，形状 (B, n_kv_heads, cache_len, head_dim)
         Returns:
@@ -144,14 +215,36 @@ class CausalSelfAttention(nn.Module):
         k_expanded = self._repeat_kv(k, self.n_rep)
         v_expanded = self._repeat_kv(v, self.n_rep)
 
-        # Flash Attention（PyTorch 2.0+）
+        # 构建注意力掩码
+        S = k_expanded.shape[2]  # key 序列长度（可能包含 cache）
+        attn_mask = None
+
         # 使用缓存时 Q 只有当前 token，不需要 causal mask
-        is_causal = (kv_cache is None) and (T > 1)
+        use_causal = (kv_cache is None) and (T > 1)
+
+        if attention_mask is not None:
+            # attention_mask: (B, S) -> (B, 1, 1, S)
+            # 1 表示有效，0 表示忽略
+            # scaled_dot_product_attention 需要: True 表示屏蔽
+            attn_mask = attention_mask[:, None, None, :S].to(dtype=x.dtype)
+            attn_mask = (1.0 - attn_mask) * torch.finfo(x.dtype).min
+
+            if use_causal:
+                # 构建因果掩码并与 padding mask 合并
+                causal_mask = torch.triu(
+                    torch.ones(T, S, dtype=x.dtype, device=x.device),
+                    diagonal=S - T + 1
+                ) * torch.finfo(x.dtype).min
+                causal_mask = causal_mask[None, None, :, :]  # (1, 1, T, S)
+                attn_mask = attn_mask + causal_mask
+                use_causal = False  # 已经手动处理了因果掩码
+
+        # Flash Attention（PyTorch 2.0+）
         out = F.scaled_dot_product_attention(
             q, k_expanded, v_expanded,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal,
+            is_causal=use_causal,
         )
 
         # 合并多头: (B, n_head, T, head_dim) -> (B, T, C)
@@ -204,31 +297,32 @@ class CausalSelfAttention(nn.Module):
 class FeedForward(nn.Module):
     """前馈网络：SwiGLU 激活"""
 
-    def __init__(self, n_embd):
+    def __init__(self, config: NanoGPTConfig):
         super().__init__()
+        n_embd = config.n_embed
         # 隐藏层维度，用 8/3 保持参数量相近
         hidden_dim = int(8 / 3 * n_embd)
-        
+
         self.w1 = nn.Linear(n_embd, hidden_dim, bias=False)  # 门控分支
         self.w2 = nn.Linear(n_embd, hidden_dim, bias=False)  # 值分支
         self.w3 = nn.Linear(hidden_dim, n_embd, bias=False)  # 输出投影
-        self.dropout = nn.Dropout(DROP_OUT)
+        self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 第一步：门控分支，过 SiLU 激活
         gate = self.w1(x)
         gate = F.silu(gate)
-        
+
         # 第二步：值分支，不过激活函数
         up = self.w2(x)
-        
+
         # 第三步：门控相乘
         hidden = gate * up
-        
+
         # 第四步：输出投影
         out = self.w3(hidden)
         out = self.dropout(out)
-        
+
         return out
 
 
@@ -280,28 +374,33 @@ class Router(nn.Module):
 class MoELayer(nn.Module):
     """
     Mixture of Experts 层 (带共享专家)
-    
+
     架构:
     - 共享专家 (Shared Experts): 处理所有 token，学习通用知识
     - 路由专家 (Routed Experts): 根据 Router 选择性激活，学习专业知识
-    
+
     输出 = 共享专家输出 + 路由专家加权输出
     """
 
-    def __init__(self, n_embd, num_experts, num_shared_experts, top_k):
+    def __init__(self, config: NanoGPTConfig):
         super().__init__()
+        n_embd = config.n_embed
+        num_experts = config.num_experts
+        num_shared_experts = config.num_shared_experts
+        top_k = config.top_k
+
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
         self.top_k = top_k
-        
+
         # 路由专家 (Routed Experts)
-        self.experts = nn.ModuleList([FeedForward(n_embd) for _ in range(num_experts)])
+        self.experts = nn.ModuleList([FeedForward(config) for _ in range(num_experts)])
         self.router = Router(n_embd, num_experts, top_k)
-        
+
         # 共享专家 (Shared Experts) - 如果 num_shared_experts > 0
         if num_shared_experts > 0:
             self.shared_experts = nn.ModuleList([
-                FeedForward(n_embd) for _ in range(num_shared_experts)
+                FeedForward(config) for _ in range(num_shared_experts)
             ])
         else:
             self.shared_experts = None
@@ -379,20 +478,23 @@ class Block(nn.Module):
     支持 MoE（Mixture of Experts）
     """
 
-    def __init__(self, n_embd, n_head, n_kv_heads=None, use_moe=False):
+    def __init__(self, config: NanoGPTConfig, layer_idx: int):
         super().__init__()
-        self.use_moe = use_moe
-        self.sa = CausalSelfAttention(n_embd, n_head, n_kv_heads)
-        if use_moe:
-            self.ff = MoELayer(n_embd, NUM_EXPERTS, NUM_SHARED_EXPERTS, TOP_K)
-        else:
-            self.ff = FeedForward(n_embd)
-        self.ln1 = RMSNorm(n_embd)
-        self.ln2 = RMSNorm(n_embd)
+        # 根据 layer_idx 和 moe_freq 判断是否使用 MoE
+        self.use_moe = config.use_moe and (layer_idx % config.moe_freq == 1)
+        self.layer_idx = layer_idx
 
-    def forward(self, x, start_pos=0, kv_cache=None):
+        self.sa = CausalSelfAttention(config)
+        if self.use_moe:
+            self.ff = MoELayer(config)
+        else:
+            self.ff = FeedForward(config)
+        self.ln1 = RMSNorm(config.n_embed)
+        self.ln2 = RMSNorm(config.n_embed)
+
+    def forward(self, x, attention_mask=None, start_pos=0, kv_cache=None):
         # 残差连接：x = x + sublayer(LayerNorm(x))
-        h, new_kv_cache = self.sa(self.ln1(x), start_pos, kv_cache)
+        h, new_kv_cache = self.sa(self.ln1(x), attention_mask, start_pos, kv_cache)
         x = x + h
         if self.use_moe:
             ff_out, aux_loss = self.ff(self.ln2(x))
@@ -404,51 +506,48 @@ class Block(nn.Module):
 
 
 # ============================================================================
-# 主模型定义
+# 主模型定义 (HuggingFace 兼容)
 # ============================================================================
 
-class GPTLanguageModel(nn.Module):
+class GPTLanguageModel(PreTrainedModel):
     """
-    GPT 风格的语言模型
+    GPT 风格的语言模型，继承自 HuggingFace PreTrainedModel
 
     特性：
     - GQA 分组查询注意力 + Flash Attention
     - KV Cache 推理加速
     - RoPE 旋转位置编码
     - GPT-2 风格权重初始化
+    - 兼容 HuggingFace save_pretrained / from_pretrained
+    - 兼容 HuggingFace generate()
     """
+    config_class = NanoGPTConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Block"]
 
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.use_moe = USE_MOE  # 保存配置供 forward 使用
+    def __init__(self, config: NanoGPTConfig):
+        super().__init__(config)
+        self.config = config
 
         # Token 嵌入 (使用 RoPE，不需要位置嵌入)
-        self.token_embedding_table = nn.Embedding(vocab_size, N_EMBED)
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embed)
 
         # Transformer 层（使用 GQA + KV Cache）
-        # MoE: 交替层使用（奇数层：1, 3, 5, 7, 9, 11）
-        from config import MOE_FREQ
         self.blocks = nn.ModuleList([
-            Block(N_EMBED, N_HEADS, N_KV_HEADS,
-                  use_moe=(USE_MOE and i % MOE_FREQ == 1))
-            for i in range(N_LAYERS)
+            Block(config, i) for i in range(config.n_layers)
         ])
-        self.ln_f = RMSNorm(N_EMBED)  # 最终的 RMSNorm
+        self.ln_f = RMSNorm(config.n_embed)  # 最终的 RMSNorm
 
         # 输出头：将嵌入映射到词汇表大小
-        self.lm_head = nn.Linear(N_EMBED, vocab_size, bias=False)
-
-        # 应用 GPT-2 风格权重初始化
-        self.apply(self._init_weights)
+        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
         # 权重共享：Embedding 与 LM Head 共用同一权重矩阵
-        self.lm_head.weight = self.token_embedding_table.weight
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.token_embedding_table.weight
 
-        # 残差投影层特殊缩放（GPT-2 论文）
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * N_LAYERS))
+        # 初始化权重
+        self.post_init()
 
     def _init_weights(self, module):
         """GPT-2 风格的权重初始化"""
@@ -461,119 +560,160 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, idx, targets=None, start_pos=0, kv_caches=None):
+        # 残差投影层特殊缩放（GPT-2 论文）
+        if isinstance(module, nn.Linear) and hasattr(module, 'weight'):
+            for pn, p in self.named_parameters():
+                if pn.endswith('c_proj.weight') and p is module.weight:
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layers))
+
+    def get_input_embeddings(self):
+        return self.token_embedding_table
+
+    def set_input_embeddings(self, value):
+        self.token_embedding_table = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
         """
+        HuggingFace 兼容的 forward 方法
+
         Args:
-            idx: 输入 token ids (B, T)
-            targets: 目标 token ids (B, T)，用于计算损失
-            start_pos: 当前位置索引（用于 KV Cache）
-            kv_caches: List[Tuple[k, v]]，每层一个缓存
+            input_ids: 输入 token ids (B, T)
+            attention_mask: 注意力掩码 (B, S)，1 表示有效，0 表示忽略（padding）
+                           S 是完整序列长度（包括 KV cache 中的历史 token）
+            past_key_values: KV Cache，List[Tuple[k, v]]
+            labels: 标签 token ids (B, T)，用于计算损失
+            use_cache: 是否返回 KV Cache
+            output_attentions: 是否返回注意力权重（暂不支持）
+            output_hidden_states: 是否返回隐藏状态（暂不支持）
+            return_dict: 是否返回 dict 格式
+
         Returns:
-            logits: 输出 logits
-            loss: 损失（如果提供 targets）
-            new_kv_caches: 更新后的 KV 缓存列表
+            CausalLMOutputWithPast 包含 loss, logits, past_key_values
         """
-        B, T = idx.shape
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        B, T = input_ids.shape
+
+        # 计算 start_pos（用于 RoPE 和 KV Cache）
+        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+            start_pos = past_key_values[0][0].shape[2]  # cache_len
+        else:
+            start_pos = 0
 
         # 嵌入 (RoPE 在注意力层内部应用)
-        tok_emb = self.token_embedding_table(idx)  # (B, T, N_EMBED)
+        tok_emb = self.token_embedding_table(input_ids)  # (B, T, n_embed)
         x = tok_emb
 
         # Transformer 处理（逐层传递 KV Cache）
-        new_kv_caches = []
+        new_kv_caches = [] if use_cache else None
         total_aux_loss = 0.0
 
         for i, block in enumerate(self.blocks):
-            kv_cache = kv_caches[i] if kv_caches is not None else None
+            kv_cache = past_key_values[i] if past_key_values is not None else None
             if block.use_moe:
-                x, new_kv_cache, aux_loss = block(x, start_pos, kv_cache)
+                x, new_kv_cache, aux_loss = block(x, attention_mask, start_pos, kv_cache)
                 total_aux_loss += aux_loss
             else:
-                x, new_kv_cache = block(x, start_pos, kv_cache)
-            new_kv_caches.append(new_kv_cache)
+                x, new_kv_cache = block(x, attention_mask, start_pos, kv_cache)
+
+            if use_cache:
+                new_kv_caches.append(new_kv_cache)
 
         x = self.ln_f(x)
 
         # 输出 logits
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
-        # 计算损失（如果需要）
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits_flat = logits.view(B * T, C)
-            targets_flat = targets.view(B * T)
-            ce_loss = F.cross_entropy(logits_flat, targets_flat)
+        # 计算损失（如果提供 labels）
+        loss = None
+        if labels is not None:
+            # Shift 以计算下一个 token 预测损失
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # 计算交叉熵损失
+            loss_fct = nn.CrossEntropyLoss()
+            ce_loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1)
+            )
 
             # 仅当使用 MoE 时添加辅助损失
-            if self.use_moe:
-                loss = ce_loss + AUX_LOSS_COEF * total_aux_loss
+            if self.config.use_moe and total_aux_loss > 0:
+                loss = ce_loss + self.config.aux_loss_coef * total_aux_loss
             else:
                 loss = ce_loss
 
-        return logits, loss, new_kv_caches
+        if not return_dict:
+            output = (logits, new_kv_caches)
+            return ((loss,) + output) if loss is not None else output
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_p=0.9, use_kv_cache=True):
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=new_kv_caches,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         """
-        生成文本，使用 Top-p (Nucleus) Sampling
+        为 HuggingFace generate() 准备输入
 
-        Args:
-            idx: 输入 token ids (B, T)
-            max_new_tokens: 最大生成 token 数
-            temperature: 温度参数 (越高越随机)
-            top_p: nucleus sampling 阈值
-            use_kv_cache: 是否使用 KV Cache 加速推理
+        当使用 KV Cache 时，只需要传入最后一个 token
         """
-        kv_caches = None
+        # 如果有 past_key_values，只取最后一个 token
+        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+            # 检查缓存长度，避免超过 max_seq_len
+            cache_len = past_key_values[0][0].shape[2]
+            if cache_len >= self.config.max_seq_len:
+                # 截断缓存
+                past_key_values = [
+                    (k[:, :, 1:, :], v[:, :, 1:, :]) for k, v in past_key_values
+                ]
+            input_ids = input_ids[:, -1:]
 
-        for i in range(max_new_tokens):
-            if use_kv_cache:
-                if i == 0:
-                    # 第一次：处理整个输入序列
-                    idx_cond = idx[:, -MAX_SEQ_LEN:]
-                    start_pos = 0
-                    kv_caches = None
-                else:
-                    # 后续：只处理最后一个 token
-                    idx_cond = idx[:, -1:]
-                    start_pos = min(idx.shape[1] - 1, MAX_SEQ_LEN - 1)
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": True,
+            "attention_mask": attention_mask,
+        }
 
-                    # 如果超过 MAX_SEQ_LEN，需要截断缓存
-                    if idx.shape[1] > MAX_SEQ_LEN:
-                        kv_caches = [(k[:, :, 1:, :], v[:, :, 1:, :]) for k, v in kv_caches]
-            else:
-                # 不使用缓存：每次处理整个序列
-                idx_cond = idx[:, -MAX_SEQ_LEN:]
-                start_pos = 0
-                kv_caches = None
-
-            # 前向传播
-            logits, _, kv_caches = self(idx_cond, start_pos=start_pos, kv_caches=kv_caches)
-            logits = logits[:, -1, :]  # 最后一个位置 (B, vocab_size)
-
-            # 应用温度
-            logits = logits / temperature
-
-            # Top-p Sampling
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # 移除累积概率超过 top_p 的 token
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # 保留第一个超过阈值的 token
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            # 将移除的 token 设为 -inf
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                1, sorted_indices, sorted_indices_to_remove
+    def _reorder_cache(self, past_key_values, beam_idx):
+        """
+        为 beam search 重排 KV Cache
+        """
+        reordered_past = []
+        for layer_past in past_key_values:
+            reordered_past.append(
+                tuple(
+                    past_state.index_select(0, beam_idx.to(past_state.device))
+                    for past_state in layer_past
+                )
             )
-            logits[indices_to_remove] = float('-inf')
-
-            # 采样
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+        return reordered_past

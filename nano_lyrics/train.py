@@ -7,14 +7,14 @@ NanoGPT 训练脚本
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import json
-import re
+from torch.utils.data import DataLoader
 import os
 import math
 
+from transformers import PreTrainedTokenizerFast, GenerationConfig
+
 from config import (
-    LYRICS_DIR, MAX_SONGS, RANDOM_SEED,
+    RANDOM_SEED,
     BATCH_SIZE, MAX_SEQ_LEN, LEARNING_RATE, MIN_LR, WARMUP_ITERS, TRAIN_ITERS,
     EVAL_ITERS, EVAL_INTERVAL, WEIGHT_DECAY, GRAD_CLIP,
     NUM_WORKERS, PIN_MEMORY, PREFETCH_FACTOR,
@@ -23,147 +23,114 @@ from config import (
     SWANLAB_PROJECT, SWANLAB_RUN_NAME, USE_SWANLAB,
     INITIAL_GENERATE_TOKENS, FINAL_GENERATE_TOKENS, GENERATE_PROMPT,
     DEVICE,
+    # 模型配置
+    N_EMBED, N_HEADS, N_KV_HEADS, N_LAYERS, DROP_OUT,
+    USE_MOE, NUM_EXPERTS, NUM_SHARED_EXPERTS, TOP_K, MOE_FREQ, AUX_LOSS_COEF,
 )
+
+from model import GPTLanguageModel, NanoGPTConfig
+from tokenizer import (
+    train_bpe_tokenizer, encode, decode, get_vocab_size, get_pad_id,
+    get_eos_id, get_im_start_id, CHAT_TEMPLATE,
+    PAD_TOKEN, EOS_TOKEN, IM_START_TOKEN, IM_END_TOKEN,
+)
+from data import load_lyrics, preprocess_lyric, LyricsDataset
 
 # 延迟导入 swanlab（仅在需要时）
 swanlab = None
-from model import GPTLanguageModel
-from tokenizer import train_bpe_tokenizer, encode, decode, get_bos_id, get_vocab_size, get_pad_id
 
 
 # ============================================================================
-# 数据加载与预处理
+# 模型保存与加载 (HuggingFace 格式)
 # ============================================================================
 
-def load_lyrics(max_songs=MAX_SONGS):
-    """加载歌词文件，限制歌曲数量"""
-    all_lyrics = []
-    for i in range(1, 6):
-        if len(all_lyrics) >= max_songs:
-            break
-        filepath = f'{LYRICS_DIR}/lyrics{i}.json'
-        with open(filepath, 'r', encoding='utf-8') as f:
-            songs = json.load(f)
-            remaining = max_songs - len(all_lyrics)
-            all_lyrics.extend(songs[:remaining])
-    return all_lyrics
-
-
-def preprocess_lyric(lyric_lines):
+def save_model_hf(model, tokenizer, save_path, optimizer_state=None, iter_num=None, best_val_loss=None):
     """
-    预处理单首歌的歌词
+    保存模型为 HuggingFace 格式
 
-    过滤掉：
-    - 元信息（作词、作曲、编曲等）
-    - 结构标记（主歌、副歌、间奏等）
-    - 单字符行
+    Args:
+        model: GPTLanguageModel 实例
+        tokenizer: tokenizers.Tokenizer 实例
+        save_path: 保存目录
+        optimizer_state: 优化器状态（可选，用于恢复训练）
+        iter_num: 当前迭代次数
+        best_val_loss: 最佳验证损失
     """
-    skip_patterns = [
-        r'^作词', r'^作曲', r'^编曲', r'^演唱', r'^和声', r'^后期', r'^混音',
-        r'^制作', r'^录音', r'^吉他', r'^钢琴', r'^贝斯', r'^鼓',
-        r'^主歌\d*$', r'^副歌\d*$', r'^过渡\d*$', r'^间奏', r'^结尾',
-        r'^verse', r'^chorus', r'^bridge', r'^\[', r'^【', r'^（.*）$',
-        r'^\(.*\)$', r'^demo$', r'^intro', r'^outro',
-    ]
+    os.makedirs(save_path, exist_ok=True)
 
-    result = []
-    for line in lyric_lines:
-        line = line.strip()
-        if not line:
-            continue
-        # 检查是否匹配跳过模式
-        skip = any(re.match(p, line, re.IGNORECASE) for p in skip_patterns)
-        if not skip and len(line) > 1:  # 过滤单字符行
-            result.append(line)
+    # 获取原始模型（如果使用了 torch.compile）
+    model_to_save = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-    return '\n'.join(result)
+    # 保存模型和配置（使用 safetensors 格式）
+    model_to_save.save_pretrained(save_path, safe_serialization=True)
 
+    # 创建 HF tokenizer 并保存
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        bos_token=IM_START_TOKEN,
+        eos_token=EOS_TOKEN,
+        pad_token=PAD_TOKEN,
+        unk_token=None,
+        additional_special_tokens=[IM_START_TOKEN, IM_END_TOKEN],
+        model_max_length=MAX_SEQ_LEN,
+    )
+    hf_tokenizer.chat_template = CHAT_TEMPLATE
+    hf_tokenizer.save_pretrained(save_path)
 
-# ============================================================================
-# Dataset 和 DataLoader
-# ============================================================================
+    # 保存生成配置
+    gen_config = GenerationConfig(
+        max_new_tokens=200,
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.9,
+        pad_token_id=get_pad_id(tokenizer),
+        eos_token_id=get_eos_id(tokenizer),
+        bos_token_id=get_im_start_id(tokenizer),
+    )
+    gen_config.save_pretrained(save_path)
 
-class LyricsDataset(Dataset):
-    """歌词数据集（按歌曲切分，支持 loss_mask）"""
-
-    def __init__(self, samples, block_size, pad_id):
-        """
-        Args:
-            samples: List[List[int]], 每首歌的 token ids
-            block_size: 最大序列长度
-            pad_id: padding token id
-        """
-        self.samples = samples
-        self.block_size = block_size
-        self.pad_id = pad_id
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        tokens = self.samples[idx].copy()
-
-        # 截断或填充到 block_size + 1（因为需要 x 和 y 各 block_size 长度）
-        if len(tokens) > self.block_size + 1:
-            tokens = tokens[:self.block_size + 1]
-        else:
-            tokens = tokens + [self.pad_id] * (self.block_size + 1 - len(tokens))
-
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        x = tokens[:-1]  # (block_size,)
-        y = tokens[1:]   # (block_size,)
-
-        # loss_mask: 1 表示计算 loss，0 表示忽略（padding 位置）
-        loss_mask = (y != self.pad_id).long()
-
-        return x, y, loss_mask
-
-
-# ============================================================================
-# Checkpoint 保存与恢复
-# ============================================================================
-
-def save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size, path):
-    """保存训练检查点"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    model_state = model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
-
-    checkpoint = {
-        'model': model_state,
-        'optimizer': optimizer.state_dict(),
-        'iter_num': iter_num,
-        'best_val_loss': best_val_loss,
-        'config': {
-            'vocab_size': vocab_size,
-            'n_embed': 768,
-            'n_heads': 12,
-            'n_layers': 12,
-            'max_seq_len': MAX_SEQ_LEN,
-            'batch_size': BATCH_SIZE,
+    # 保存训练状态（用于恢复训练）
+    if optimizer_state is not None or iter_num is not None:
+        training_state = {
+            'optimizer': optimizer_state,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
         }
-    }
-    torch.save(checkpoint, path)
-    print(f"  -> Checkpoint 已保存: {path}")
+        torch.save(training_state, os.path.join(save_path, 'training_state.pt'))
+
+    print(f"  -> 模型已保存: {save_path}")
 
 
-def load_checkpoint(path, model, optimizer=None):
-    """加载训练检查点"""
-    print(f"加载 Checkpoint: {path}")
-    checkpoint = torch.load(path, map_location=DEVICE)
+def load_model_hf(load_path, device=DEVICE, dtype=torch.bfloat16):
+    """
+    从 HuggingFace 格式加载模型
 
-    if hasattr(model, '_orig_mod'):
-        model._orig_mod.load_state_dict(checkpoint['model'])
-    else:
-        model.load_state_dict(checkpoint['model'])
+    Args:
+        load_path: 模型目录
+        device: 设备
+        dtype: 数据类型
 
-    if optimizer is not None and 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
+    Returns:
+        model: GPTLanguageModel 实例
+        training_state: 训练状态字典（如果存在）
+    """
+    print(f"加载模型: {load_path}")
 
-    iter_num = checkpoint.get('iter_num', 0)
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    # 加载模型
+    model = GPTLanguageModel.from_pretrained(
+        load_path,
+        torch_dtype=dtype,
+    ).to(device)
 
-    print(f"  -> 恢复自: iter={iter_num}, best_val_loss={best_val_loss:.4f}")
-    return iter_num, best_val_loss
+    # 加载训练状态（如果存在）
+    training_state_path = os.path.join(load_path, 'training_state.pt')
+    training_state = None
+    if os.path.exists(training_state_path):
+        training_state = torch.load(training_state_path, map_location=device)
+        print(f"  -> 恢复训练状态: iter={training_state.get('iter_num', 0)}, "
+              f"best_val_loss={training_state.get('best_val_loss', float('inf')):.4f}")
+
+    return model, training_state
 
 
 # ============================================================================
@@ -301,8 +268,30 @@ def main():
         )
         print(f"Swanlab 初始化完成: {run_name}")
 
+    # ========== 创建模型配置 ==========
+    config = NanoGPTConfig(
+        vocab_size=vocab_size,
+        n_embed=N_EMBED,
+        n_heads=N_HEADS,
+        n_kv_heads=N_KV_HEADS,
+        n_layers=N_LAYERS,
+        max_seq_len=MAX_SEQ_LEN,
+        dropout=DROP_OUT,
+        # MoE 配置
+        use_moe=USE_MOE,
+        num_experts=NUM_EXPERTS,
+        num_shared_experts=NUM_SHARED_EXPERTS,
+        top_k=TOP_K,
+        moe_freq=MOE_FREQ,
+        aux_loss_coef=AUX_LOSS_COEF,
+        # HF 兼容参数
+        pad_token_id=pad_id,
+        bos_token_id=get_im_start_id(tokenizer),
+        eos_token_id=get_eos_id(tokenizer),
+    )
+
     # ========== 创建模型 ==========
-    model = GPTLanguageModel(vocab_size).to(DEVICE).to(torch.bfloat16)
+    model = GPTLanguageModel(config).to(DEVICE).to(torch.bfloat16)
     print("训练精度: BF16")
 
     # torch.compile 加速（PyTorch 2.0+）
@@ -341,14 +330,17 @@ def main():
         model.eval()
         for split, loader in [('train', train_loader), ('test', test_loader)]:
             losses = []
-            for i, (X, Y, loss_mask) in enumerate(loader):
+            for i, (X, Y, loss_mask, attn_mask) in enumerate(loader):
                 if i >= EVAL_ITERS:
                     break
                 X = X.to(DEVICE, non_blocking=True)
                 Y = Y.to(DEVICE, non_blocking=True)
                 loss_mask = loss_mask.to(DEVICE, non_blocking=True)
+                attn_mask = attn_mask.to(DEVICE, non_blocking=True)
 
-                logits, _, _ = model(X)
+                # 使用 HF 兼容的 forward 接口
+                outputs = model(input_ids=X, attention_mask=attn_mask, use_cache=False)
+                logits = outputs.logits
                 B, T, C = logits.shape
                 loss_per_token = F.cross_entropy(
                     logits.view(B * T, C), Y.view(B * T), reduction='none'
@@ -362,18 +354,32 @@ def main():
     # ========== 尝试从 checkpoint 恢复 ==========
     start_iter = 0
     best_val_loss = float('inf')
-    resume_path = f'{CHECKPOINT_DIR}/latest.pt'
+    resume_path = f'{CHECKPOINT_DIR}/latest'
 
     if RESUME and os.path.exists(resume_path):
-        start_iter, best_val_loss = load_checkpoint(resume_path, model, optimizer)
-        start_iter += 1
+        # 使用 HF 格式加载
+        loaded_model, training_state = load_model_hf(resume_path, DEVICE, torch.bfloat16)
+        # 复制权重到当前模型
+        if hasattr(model, '_orig_mod'):
+            model._orig_mod.load_state_dict(loaded_model.state_dict())
+        else:
+            model.load_state_dict(loaded_model.state_dict())
+        del loaded_model
+
+        if training_state:
+            start_iter = training_state.get('iter_num', 0) + 1
+            best_val_loss = training_state.get('best_val_loss', float('inf'))
+            if training_state.get('optimizer'):
+                optimizer.load_state_dict(training_state['optimizer'])
     else:
         # 测试初始状态
         test_iter = iter(train_loader)
-        xb, yb, loss_mask_init = next(test_iter)
+        xb, yb, loss_mask_init, attn_mask_init = next(test_iter)
         xb, yb = xb.to(DEVICE), yb.to(DEVICE)
         loss_mask_init = loss_mask_init.to(DEVICE)
-        logits, _, _ = model(xb)
+        attn_mask_init = attn_mask_init.to(DEVICE)
+        outputs = model(input_ids=xb, attention_mask=attn_mask_init, use_cache=False)
+        logits = outputs.logits
         B, T, C = logits.shape
         loss_per_token = F.cross_entropy(
             logits.view(B * T, C), yb.view(B * T), reduction='none'
@@ -381,12 +387,22 @@ def main():
         loss = (loss_per_token * loss_mask_init).sum() / loss_mask_init.sum()
         print(f"初始 loss: {loss:.4f}")
 
-        # 训练前生成
+        # 训练前生成（使用 HF generate）
         print("\n" + "=" * 50)
         print("训练前生成的文本:")
         print("=" * 50)
+        model.eval()
         context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-        print(decode(model.generate(context, max_new_tokens=INITIAL_GENERATE_TOKENS)[0].tolist(), tokenizer))
+        generated = model.generate(
+            context,
+            max_new_tokens=INITIAL_GENERATE_TOKENS,
+            do_sample=True,
+            temperature=1.0,
+            top_p=0.9,
+            pad_token_id=pad_id,
+        )
+        print(decode(generated[0].tolist(), tokenizer))
+        model.train()
 
     # ========== 训练循环 ==========
     print("\n" + "=" * 50)
@@ -418,20 +434,35 @@ def main():
             # 保存最佳模型
             if SAVE_BEST and losses['test'] < best_val_loss:
                 best_val_loss = losses['test']
-                save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size,
-                              f'{CHECKPOINT_DIR}/best.pt')
+                save_model_hf(
+                    model, tokenizer, f'{CHECKPOINT_DIR}/best',
+                    optimizer_state=optimizer.state_dict(),
+                    iter_num=iter_num,
+                    best_val_loss=best_val_loss
+                )
 
             # 定期保存 + 生成预测
             if iter_num > 0 and iter_num % SAVE_INTERVAL == 0:
-                save_checkpoint(model, optimizer, iter_num, best_val_loss, vocab_size,
-                              f'{CHECKPOINT_DIR}/ckpt_{iter_num}.pt')
+                save_model_hf(
+                    model, tokenizer, f'{CHECKPOINT_DIR}/ckpt_{iter_num}',
+                    optimizer_state=optimizer.state_dict(),
+                    iter_num=iter_num,
+                    best_val_loss=best_val_loss
+                )
 
-                # 每 1000 步生成一次预测
+                # 每 1000 步生成一次预测（使用 HF generate）
                 model.eval()
                 with torch.no_grad():
                     context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-                    generated = model.generate(context, max_new_tokens=100)[0].tolist()
-                    generated_text = decode(generated, tokenizer)
+                    generated = model.generate(
+                        context,
+                        max_new_tokens=100,
+                        do_sample=True,
+                        temperature=1.0,
+                        top_p=0.9,
+                        pad_token_id=pad_id,
+                    )
+                    generated_text = decode(generated[0].tolist(), tokenizer)
                     print(f"\n--- Step {iter_num} 生成预览 ---")
                     print(generated_text)
                     print("-" * 30 + "\n")
@@ -446,24 +477,29 @@ def main():
 
         # 获取批次（循环重用）
         try:
-            xb, yb, loss_mask = next(train_iter)
+            xb, yb, loss_mask, attn_mask = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            xb, yb, loss_mask = next(train_iter)
+            xb, yb, loss_mask, attn_mask = next(train_iter)
 
         xb = xb.to(DEVICE, non_blocking=True)
         yb = yb.to(DEVICE, non_blocking=True)
         loss_mask = loss_mask.to(DEVICE, non_blocking=True)
+        attn_mask = attn_mask.to(DEVICE, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # 前向传播（带 loss_mask）
-        logits, _, _ = model(xb)
+        # 前向传播（使用 HF 兼容接口，带 attention_mask）
+        outputs = model(input_ids=xb, attention_mask=attn_mask, use_cache=False)
+        logits = outputs.logits
         B, T, C = logits.shape
         loss_per_token = F.cross_entropy(
             logits.view(B * T, C), yb.view(B * T), reduction='none'
         ).view(B, T)
         loss = (loss_per_token * loss_mask).sum() / loss_mask.sum()
+
+        # 如果模型使用了 MoE，可能需要添加辅助损失（已在 forward 中处理）
+        # 这里使用手动计算的 loss_mask 损失
 
         # 反向传播
         loss.backward()
@@ -474,12 +510,16 @@ def main():
         optimizer.step()
 
     # ========== 保存最终模型 ==========
-    save_checkpoint(model, optimizer, TRAIN_ITERS - 1, best_val_loss, vocab_size,
-                   f'{CHECKPOINT_DIR}/latest.pt')
+    save_model_hf(
+        model, tokenizer, f'{CHECKPOINT_DIR}/latest',
+        optimizer_state=optimizer.state_dict(),
+        iter_num=TRAIN_ITERS - 1,
+        best_val_loss=best_val_loss
+    )
 
     # 最终评估
     losses = estimate_loss()
-    print(f"\n训练完成!")
+    print("\n训练完成!")
     print(f"最终 train loss: {losses['train']:.4f} | test loss: {losses['test']:.4f}")
     print(f"最佳 test loss: {best_val_loss:.4f}")
 
@@ -491,12 +531,21 @@ def main():
             'best_test_loss': best_val_loss,
         })
 
-    # 训练后生成
+    # 训练后生成（使用 HF generate）
     print("\n" + "=" * 50)
     print("训练后生成的文本:")
     print("=" * 50)
+    model.eval()
     context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-    final_generated = decode(model.generate(context, max_new_tokens=FINAL_GENERATE_TOKENS)[0].tolist(), tokenizer)
+    final_generated_ids = model.generate(
+        context,
+        max_new_tokens=FINAL_GENERATE_TOKENS,
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.9,
+        pad_token_id=pad_id,
+    )
+    final_generated = decode(final_generated_ids[0].tolist(), tokenizer)
     print(final_generated)
 
     # 记录最终生成到 swanlab
@@ -505,9 +554,12 @@ def main():
         swanlab.finish()
         print("\nSwanlab 日志已完成")
 
-    print(f"\nCheckpoint 保存位置: {CHECKPOINT_DIR}/")
-    print(f"  - best.pt: 最佳模型 (test loss: {best_val_loss:.4f})")
-    print(f"  - latest.pt: 最新模型")
+    print(f"\n模型保存位置: {CHECKPOINT_DIR}/")
+    print(f"  - best/: 最佳模型 (test loss: {best_val_loss:.4f})")
+    print(f"  - latest/: 最新模型")
+    print("\n可使用以下方式加载模型:")
+    print(f"  model = GPTLanguageModel.from_pretrained('{CHECKPOINT_DIR}/best')")
+    print(f"  tokenizer = PreTrainedTokenizerFast.from_pretrained('{CHECKPOINT_DIR}/best')")
 
 
 if __name__ == '__main__':
