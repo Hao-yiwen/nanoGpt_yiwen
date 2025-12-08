@@ -40,6 +40,11 @@ from data import load_lyrics, preprocess_lyric, LyricsDataset
 swanlab = None
 
 
+def get_generate_model(model):
+    """获取可用于生成的模型（处理 torch.compile 包装）"""
+    return model._orig_mod if hasattr(model, '_orig_mod') else model
+
+
 # ============================================================================
 # 模型保存与加载 (HuggingFace 格式)
 # ============================================================================
@@ -393,7 +398,8 @@ def main():
         print("=" * 50)
         model.eval()
         context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-        generated = model.generate(
+        gen_model = get_generate_model(model)
+        generated = gen_model.generate(
             context,
             max_new_tokens=INITIAL_GENERATE_TOKENS,
             do_sample=True,
@@ -454,7 +460,8 @@ def main():
                 model.eval()
                 with torch.no_grad():
                     context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-                    generated = model.generate(
+                    gen_model = get_generate_model(model)
+                    generated = gen_model.generate(
                         context,
                         max_new_tokens=100,
                         do_sample=True,
@@ -537,7 +544,8 @@ def main():
     print("=" * 50)
     model.eval()
     context = torch.tensor([encode(GENERATE_PROMPT, tokenizer)], dtype=torch.long, device=DEVICE)
-    final_generated_ids = model.generate(
+    gen_model = get_generate_model(model)
+    final_generated_ids = gen_model.generate(
         context,
         max_new_tokens=FINAL_GENERATE_TOKENS,
         do_sample=True,
