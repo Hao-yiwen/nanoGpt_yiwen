@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import json
 import re
+import math
 
 # ============================================================================
 # 超参数配置
@@ -153,6 +154,52 @@ def get_batch(split):
 # 模型组件定义
 # ============================================================================
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    正弦/余弦位置编码 (Transformer 原论文 "Attention Is All You Need")
+
+    公式:
+        PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+    其中 pos 是位置，i 是维度索引，d_model 是嵌入维度。
+    这种编码是固定的，不参与训练。
+    """
+
+    def __init__(self, d_model, max_len=BLOCK_SIZE):
+        super().__init__()
+        # 创建位置编码矩阵 (max_len, d_model)
+        pe = torch.zeros(max_len, d_model)
+
+        # 位置索引 (max_len, 1)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # 计算分母项: 10000^(2i/d_model) 的倒数，使用 exp-log 技巧提高数值稳定性
+        # div_term shape: (d_model/2,)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+
+        # 偶数维度使用 sin，奇数维度使用 cos
+        pe[:, 0::2] = torch.sin(position * div_term)  # (max_len, d_model/2)
+        pe[:, 1::2] = torch.cos(position * div_term)  # (max_len, d_model/2)
+
+        # 注册为 buffer（保存到 state_dict 但不参与梯度计算）
+        self.register_buffer('pe', pe)
+
+    def forward(self, seq_len):
+        """
+        返回指定长度的位置编码
+
+        Args:
+            seq_len: 序列长度
+
+        Returns:
+            位置编码 (seq_len, d_model)
+        """
+        return self.pe[:seq_len]
+
+
 class Head(nn.Module):
     """单个注意力头"""
 
@@ -252,9 +299,21 @@ class BigramLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Token 和位置嵌入
+        # Token 嵌入
         self.token_embedding_table = nn.Embedding(vocab_size, N_EMBED)
+
+        # ========== 位置编码（二选一）==========
+        # 方式1: 可学习位置嵌入 (GPT-1/2/3 使用此方式)
+        #   - 优点: 实现简单，可学习任意位置模式，实验效果与正弦/余弦相当
+        #   - 缺点: 无法泛化到训练时未见过的序列长度
+        #   - GPT 选择此方式因为：固定上下文长度，不需要长度外推能力
         self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBED)
+
+        # 方式2: 正弦/余弦位置编码 (Transformer 原论文 "Attention Is All You Need")
+        #   - 优点: 无需训练参数，理论上可泛化到更长序列
+        #   - 缺点: 固定公式，灵活性较低
+        #   - 现代 LLM (LLaMA, Mistral) 已转向 RoPE (旋转位置编码)
+        # self.positional_encoding = SinusoidalPositionalEncoding(N_EMBED, BLOCK_SIZE)
 
         # Transformer 层
         self.blocks = nn.Sequential(*[Block(N_EMBED, N_HEADS) for _ in range(N_LAYERS)])
@@ -279,7 +338,11 @@ class BigramLanguageModel(nn.Module):
 
         # 嵌入
         tok_emb = self.token_embedding_table(idx)  # (B, T, N_EMBED)
+        # 位置编码（与 __init__ 中的选择对应）：
+        # 方式1: 可学习位置嵌入
         pos_emb = self.position_embedding_table(torch.arange(T, device=DEVICE))  # (T, N_EMBED)
+        # 方式2: 正弦/余弦位置编码
+        # pos_emb = self.positional_encoding(T)  # (T, N_EMBED)
         x = tok_emb + pos_emb  # (B, T, N_EMBED) - 广播相加
 
         # Transformer 处理
